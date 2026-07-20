@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "apps/cli",
+    "crates/spacemind-core",
+    "crates/spacemind-rules",
+    "crates/spacemind-scanner",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+clap = { version = "=4.5.4", features = ["derive"] }
+serde = { version = "=1.0.197", features = ["derive"] }
+serde_json = "=1.0.115"
+thiserror = "=1.0.58"
+walkdir = "=2.5.0"
+spacemind-core = { path = "crates/spacemind-core" }
+spacemind-rules = { path = "crates/spacemind-rules" }
+spacemind-scanner = { path = "crates/spacemind-scanner" }
+
