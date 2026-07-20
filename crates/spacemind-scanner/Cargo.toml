@@ -1,0 +1,12 @@
+[package]
+name = "spacemind-scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spacemind-core.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+
