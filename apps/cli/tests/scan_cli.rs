@@ -1,3 +1,4 @@
+use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,17 +28,33 @@ impl Drop for TestDirectory {
 }
 
 #[test]
-fn scans_a_directory_and_emits_json() {
+fn scans_a_directory_and_emits_duplicate_json() {
     let directory = TestDirectory::new();
-    fs::write(directory.0.join("example.bin"), [0_u8; 16]).unwrap();
+    fs::write(directory.0.join("example.bin"), [7_u8; 16]).unwrap();
+    fs::write(directory.0.join("example-copy.bin"), [7_u8; 16]).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
-        .args(["scan", directory.0.to_str().unwrap(), "--format", "json"])
+        .args([
+            "scan",
+            directory.0.to_str().unwrap(),
+            "--format",
+            "json",
+            "--duplicate-min-size",
+            "1B",
+        ])
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"total_size_bytes\": 16"));
-    assert!(stdout.contains("example.bin"));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["scan"]["total_size_bytes"], 32);
+    assert_eq!(json["duplicates"]["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        json["duplicates"]["groups"][0]["unique_file_count"],
+        2
+    );
+    assert!(json["duplicates"]["potential_recovery_bytes"]
+        .as_u64()
+        .unwrap()
+        > 0);
 }
