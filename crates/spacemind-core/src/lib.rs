@@ -120,6 +120,13 @@ pub enum FindingCategory {
     LargeItem,
     OldArchive,
     OldInstaller,
+    NodeModules,
+    RustBuildArtifacts,
+    GradleCache,
+    AndroidEmulator,
+    VirtualMachine,
+    IsoImage,
+    OperatingSystemCache,
     GeneratedDirectory,
     CacheDirectory,
 }

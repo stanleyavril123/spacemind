@@ -486,7 +486,7 @@ fn default_protected_rules() -> Vec<PathRule> {
     #[cfg(target_os = "linux")]
     paths.extend([
         "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/run",
-        "/sbin", "/sys", "/usr", "/var/lib", "/var/log",
+        "/sbin", "/sys", "/usr", "/var/cache", "/var/lib", "/var/log",
     ]
     .into_iter()
     .map(PathBuf::from));
@@ -1039,6 +1039,13 @@ fn category_label(category: FindingCategory) -> &'static str {
         FindingCategory::LargeItem => "Large item",
         FindingCategory::OldArchive => "Old archive",
         FindingCategory::OldInstaller => "Old installer",
+        FindingCategory::NodeModules => "Node.js dependencies",
+        FindingCategory::RustBuildArtifacts => "Rust build artifacts",
+        FindingCategory::GradleCache => "Gradle cache",
+        FindingCategory::AndroidEmulator => "Android emulator",
+        FindingCategory::VirtualMachine => "Virtual machine",
+        FindingCategory::IsoImage => "Old ISO image",
+        FindingCategory::OperatingSystemCache => "Operating-system cache",
         FindingCategory::GeneratedDirectory => "Generated build folder",
         FindingCategory::CacheDirectory => "Cache folder",
     }
