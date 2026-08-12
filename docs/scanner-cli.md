@@ -10,6 +10,22 @@ From the repository root:
 cargo run -p spacemind-cli -- scan ~/Downloads --top 20
 ```
 
+Launch without arguments for the interactive terminal interface:
+
+```bash
+cargo run -p spacemind-cli --
+```
+
+The interface centers itself within wide terminals. Navigate its folder selector with the
+arrow keys or `j`/`k`, press `Enter` to scan the selected folder, press `c` to type a custom
+path, and press `q` to leave safely. Narrow terminals use the available width and shorten
+long paths from the beginning so the most useful final path components remain visible.
+
+Human-readable reports use numbered sections in a stable order: overview, safety,
+recommendations, relationships, duplicates, and largest items. Recommendation and relationship
+records use the same labeled fields throughout, while long paths and explanations wrap inside
+the report canvas. Use `--format json` when another program needs to parse the complete result.
+
 Limit the human-readable list to items above a given size:
 
 ```bash

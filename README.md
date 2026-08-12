@@ -18,8 +18,10 @@ After that, start it from any directory with:
 spacemind
 ```
 
-SpaceMind will show an interactive folder selector. The default choice is your current
-folder, with quick choices for Home, Downloads, Documents, and Desktop when available.
+SpaceMind opens a centered interactive folder selector. Use the arrow keys or `j`/`k` to
+move, `Enter` to scan, `c` to enter a custom path, and `q` to quit. The default choice is
+your current folder, with quick choices for Home, Downloads, Documents, and Desktop when
+available.
 
 You can also skip the selector and provide a folder directly:
 
@@ -51,8 +53,9 @@ spacemind scan ~/Downloads --format json
 ```
 
 Progress is written only to an interactive terminal on stderr, so JSON on stdout remains valid.
-The interactive interface uses terminal-aware colors. Set `NO_COLOR=1` or pipe the output
-to another command to receive plain text without ANSI color codes.
+The interface adapts to the terminal width and uses a restrained orange, charcoal, and gray
+palette. Set `NO_COLOR=1` or pipe the output to another command to receive plain text without
+ANSI color codes.
 
 ## Run without installing
 
