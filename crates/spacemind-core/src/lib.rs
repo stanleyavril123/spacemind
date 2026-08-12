@@ -120,6 +120,13 @@ pub enum FindingCategory {
     LargeItem,
     OldArchive,
     OldInstaller,
+    NodeModules,
+    RustBuildArtifacts,
+    GradleCache,
+    AndroidEmulator,
+    VirtualMachine,
+    IsoImage,
+    OperatingSystemCache,
     GeneratedDirectory,
     CacheDirectory,
 }
@@ -148,4 +155,35 @@ pub struct Finding {
     pub risk: RiskLevel,
     pub evidence: Vec<String>,
     pub suggested_action: SuggestedAction,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipKind {
+    ArchiveExtractedDirectory,
+    InstallerApplicationDirectory,
+    BuildDirectoryProject,
+    VirtualMachineComponent,
+    AndroidEmulatorConfiguration,
+    ExactDuplicate,
+}
+
+/// A deterministic connection between two scanned items.
+///
+/// Relationships are evidence for explanations. They never authorize deletion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Relationship {
+    pub kind: RelationshipKind,
+    pub source_path: PathBuf,
+    pub target_path: PathBuf,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelationshipReport {
+    pub relationships: Vec<Relationship>,
+    pub items_analyzed: u64,
 }

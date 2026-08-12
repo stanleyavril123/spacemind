@@ -4,6 +4,7 @@ members = [
     "crates/spacemind-core",
     "crates/spacemind-duplicates",
     "crates/spacemind-rules",
+    "crates/spacemind-relationships",
     "crates/spacemind-scanner",
 ]
 resolver = "2"
@@ -26,5 +27,6 @@ windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Stor
 spacemind-core = { path = "crates/spacemind-core" }
 spacemind-duplicates = { path = "crates/spacemind-duplicates" }
 spacemind-rules = { path = "crates/spacemind-rules" }
+spacemind-relationships = { path = "crates/spacemind-relationships" }
 spacemind-scanner = { path = "crates/spacemind-scanner" }
 
