@@ -24,7 +24,22 @@ For structured output:
 cargo run -p spacemind-cli -- scan ~/Downloads --format json
 ```
 
-JSON output includes the complete scan, warnings, metadata, deterministic findings, and duplicate report. It is intended to become the boundary consumed by SQLite persistence and the desktop interface.
+JSON output includes the complete scan, warnings, metadata, deterministic findings, and duplicate report. It also reports matched ignored paths, protected-item counts, and recommendations withheld by the safety policy. It is intended to become the boundary consumed by SQLite persistence and the desktop interface.
+
+## Protected paths and ignore rules
+
+Protection and ignoring have deliberately different meanings:
+
+- `--protect` scans the matching path and includes it in storage totals, but suppresses cleanup recommendations for it and every descendant. Protected duplicate copies remain visible as evidence and are excluded from unsafe recovery estimates.
+- `--ignore` prunes the matching path before metadata collection. Its contents are absent from totals, rules, and duplicate detection.
+
+Both options are repeatable and accept exact paths or `*`, `?`, and `**` wildcard patterns. Quote wildcard rules so the shell does not expand them before SpaceMind receives them:
+
+```bash
+spacemind scan ~ --protect ~/Documents --ignore "**/.git/**" --ignore "node_modules"
+```
+
+On Linux, SpaceMind protects standard operating-system locations such as `/etc`, `/usr`, `/boot`, and `/var/lib` by default. On Windows, it protects Windows, Program Files, and ProgramData locations discovered from the environment. Use `--no-default-protections` only when you intentionally want recommendations inside those locations. This option does not disable explicit `--protect` rules.
 
 ## Exact duplicate detection
 

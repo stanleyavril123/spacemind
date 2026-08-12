@@ -1,6 +1,6 @@
 use spacemind_core::{
-    AnalysisPhase, CancellationToken, FileIdentity, ItemKind, ProgressEvent, ScanResult,
-    ScanWarning, ScannedItem,
+    AnalysisPhase, CancellationToken, FileIdentity, ItemKind, PathMatcher, PathRule,
+    PathRuleError, ProgressEvent, ScanResult, ScanWarning, ScannedItem,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -16,6 +16,7 @@ const PROGRESS_INTERVAL_ITEMS: u64 = 128;
 pub struct ScanOptions {
     pub root: PathBuf,
     pub cross_filesystems: bool,
+    pub ignored_rules: Vec<PathRule>,
 }
 
 impl ScanOptions {
@@ -23,6 +24,7 @@ impl ScanOptions {
         Self {
             root: root.into(),
             cross_filesystems: false,
+            ignored_rules: Vec::new(),
         }
     }
 }
@@ -33,6 +35,8 @@ pub enum ScanError {
     RootAccess { path: PathBuf, source: io::Error },
     #[error("scan root is not a directory: {0}")]
     RootNotDirectory(PathBuf),
+    #[error("invalid ignore rule: {0}")]
+    InvalidIgnoreRule(#[from] PathRuleError),
     #[error("scan cancelled after processing {items_processed} items and {bytes_processed} bytes")]
     Cancelled {
         items_processed: u64,
@@ -94,8 +98,10 @@ where
     if !options.cross_filesystems {
         walker = walker.same_file_system(true);
     }
+    let ignored_matcher = PathMatcher::new(&root, &options.ignored_rules)?;
 
     let mut items = Vec::new();
+    let mut ignored_paths = Vec::new();
     let mut warnings = Vec::new();
     let mut directory_sizes: HashMap<PathBuf, u64> = HashMap::new();
     let mut directory_allocated_sizes: HashMap<PathBuf, u64> = HashMap::new();
@@ -104,7 +110,14 @@ where
     let mut file_count = 0_u64;
     let mut directory_count = 0_u64;
 
-    for result in walker {
+    for result in walker.into_iter().filter_entry(|entry| {
+        if entry.depth() > 0 && ignored_matcher.is_match(entry.path()) {
+            ignored_paths.push(entry.path().to_path_buf());
+            false
+        } else {
+            true
+        }
+    }) {
         check_cancelled(cancellation, items_processed, bytes_processed)?;
         items_processed = items_processed.saturating_add(1);
 
@@ -258,6 +271,8 @@ where
     }
 
     items.sort_by(|left, right| left.path.cmp(&right.path));
+    ignored_paths.sort();
+    ignored_paths.dedup();
     warnings.sort_by(|left, right| left.path.cmp(&right.path));
     let total_size_bytes = directory_sizes.get(&root).copied().unwrap_or(0);
     let total_allocated_size_bytes = allocated_sizes_available.then(|| {
@@ -284,6 +299,7 @@ where
         file_count,
         directory_count,
         items,
+        ignored_paths,
         warnings,
     })
 }
@@ -697,6 +713,41 @@ mod tests {
             result.total_allocated_size_bytes,
             original_item.allocated_size_bytes
         );
+    }
+
+    #[test]
+    fn exact_ignore_rule_prunes_the_entire_subtree() {
+        let test_dir = TestDirectory::new("ignore-exact");
+        let ignored = test_dir.0.join("private");
+        fs::create_dir(&ignored).unwrap();
+        fs::write(ignored.join("secret.bin"), [0_u8; 32]).unwrap();
+        fs::write(test_dir.0.join("visible.bin"), [0_u8; 5]).unwrap();
+        let mut options = ScanOptions::new(&test_dir.0);
+        options.ignored_rules = vec![PathRule::Exact(ignored.clone())];
+
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.file_count, 1);
+        assert_eq!(result.total_size_bytes, 5);
+        assert_eq!(result.ignored_paths, vec![ignored.clone()]);
+        assert!(!result.items.iter().any(|item| item.path.starts_with(&ignored)));
+    }
+
+    #[test]
+    fn glob_ignore_rule_prunes_nested_matches() {
+        let test_dir = TestDirectory::new("ignore-glob");
+        let ignored = test_dir.0.join("app").join("node_modules");
+        fs::create_dir_all(&ignored).unwrap();
+        fs::write(ignored.join("package.js"), [0_u8; 32]).unwrap();
+        fs::write(test_dir.0.join("visible.bin"), [0_u8; 5]).unwrap();
+        let mut options = ScanOptions::new(&test_dir.0);
+        options.ignored_rules = vec![PathRule::Glob("node_modules".to_owned())];
+
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.file_count, 1);
+        assert_eq!(result.total_size_bytes, 5);
+        assert_eq!(result.ignored_paths, vec![ignored]);
     }
 
     #[cfg(unix)]

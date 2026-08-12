@@ -27,6 +27,19 @@ You can also skip the selector and provide a folder directly:
 spacemind scan ~/Downloads
 ```
 
+Keep sensitive folders in storage totals while preventing cleanup recommendations:
+
+```bash
+spacemind scan ~ --protect ~/Documents
+```
+
+Skip paths entirely with `--ignore`. Both flags can be repeated and accept quoted
+`*`, `?`, and `**` wildcard patterns:
+
+```bash
+spacemind scan ~ --ignore "**/.git/**" --ignore "node_modules"
+```
+
 During the scan, SpaceMind reports progress for filesystem scanning, duplicate hashing,
 and recommendation building. Press `Ctrl+C` to cancel safely. The analysis is read-only;
 no files are moved, deleted, or uploaded.

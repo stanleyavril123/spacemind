@@ -60,6 +60,60 @@ fn scans_a_directory_and_emits_duplicate_json() {
 }
 
 #[test]
+fn applies_ignore_and_protect_rules_end_to_end() {
+    let directory = TestDirectory::new();
+    let ignored = directory.0.join("ignored");
+    let protected = directory.0.join("Documents");
+    fs::create_dir(&ignored).unwrap();
+    fs::create_dir(&protected).unwrap();
+    fs::write(ignored.join("not-scanned.bin"), [9_u8; 9]).unwrap();
+    fs::write(protected.join("kept.bin"), [7_u8; 16]).unwrap();
+    fs::write(directory.0.join("copy.bin"), [7_u8; 16]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .args([
+            "scan",
+            directory.0.to_str().unwrap(),
+            "--format",
+            "json",
+            "--duplicate-min-size",
+            "1B",
+            "--large-threshold",
+            "1B",
+            "--ignore",
+            ignored.to_str().unwrap(),
+            "--protect",
+            protected.to_str().unwrap(),
+            "--no-default-protections",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["scan"]["total_size_bytes"], 32);
+    assert_eq!(json["scan"]["ignored_paths"].as_array().unwrap().len(), 1);
+    assert_eq!(json["policy"]["protected_items"], 2);
+    assert!(json["policy"]["suppressed_recommendations"].as_u64().unwrap() >= 2);
+    assert!(json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|finding| !finding["path"].as_str().unwrap().starts_with(protected.to_str().unwrap())));
+    let group = &json["duplicates"]["groups"][0];
+    assert_eq!(group["protected_file_count"], 1);
+    assert_eq!(
+        group["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["protected"] == true)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn zero_argument_launch_scans_the_current_directory_without_a_terminal() {
     let directory = TestDirectory::new();
     fs::write(directory.0.join("example.bin"), [7_u8; 16]).unwrap();

@@ -2,10 +2,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use spacemind_core::{
     AnalysisPhase, CancellationToken, DuplicateReport, Finding, FindingCategory, ItemKind,
-    ProgressEvent, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
+    PathRule, ProgressEvent, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
 };
 use spacemind_duplicates::{detect_duplicates_with_progress, DuplicateOptions};
-use spacemind_rules::{evaluate_with_progress, RuleOptions};
+use spacemind_rules::{evaluate_with_policy_progress, RuleOptions};
 use spacemind_scanner::{scan_with_progress, ScanOptions};
 use std::collections::HashSet;
 use std::env;
@@ -60,6 +60,18 @@ struct ScanArgs {
     #[arg(long)]
     cross_filesystems: bool,
 
+    /// Do not scan a path or subtree. Repeat for more rules; quote wildcard patterns.
+    #[arg(long, value_name = "PATH_OR_GLOB", value_parser = parse_path_rule)]
+    ignore: Vec<PathRule>,
+
+    /// Scan a path for totals, but never recommend it. Repeat for more rules.
+    #[arg(long, value_name = "PATH_OR_GLOB", value_parser = parse_path_rule)]
+    protect: Vec<PathRule>,
+
+    /// Disable SpaceMind built-in operating-system path protections.
+    #[arg(long)]
+    no_default_protections: bool,
+
     /// Size at which deterministic rules flag a large item.
     #[arg(long, value_parser = parse_size, default_value = "1GiB")]
     large_threshold: u64,
@@ -78,6 +90,9 @@ impl Default for ScanArgs {
             duplicate_min_size: 1024 * 1024,
             format: OutputFormat::Human,
             cross_filesystems: false,
+            ignore: Vec::new(),
+            protect: Vec::new(),
+            no_default_protections: false,
             large_threshold: 1024 * 1024 * 1024,
             old_days: 180,
         }
@@ -95,6 +110,18 @@ struct JsonOutput {
     scan: ScanResult,
     findings: Vec<Finding>,
     duplicates: DuplicateReport,
+    policy: PolicySummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PolicySummary {
+    ignored_rule_count: usize,
+    protected_rule_count: usize,
+    default_protections_enabled: bool,
+    ignored_paths: Vec<PathBuf>,
+    protected_items: u64,
+    protected_duplicate_copies: u64,
+    suppressed_recommendations: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +223,13 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
     };
     let theme = Theme::stdout();
     let path = resolve_scan_path(args.path, args.format, theme)?;
+    let ignored_rules = args.ignore;
+    let mut protected_rules = if args.no_default_protections {
+        Vec::new()
+    } else {
+        default_protected_rules()
+    };
+    protected_rules.extend(args.protect);
 
     if args.format == OutputFormat::Human && io::stdout().is_terminal() {
         print_scan_start(&path, theme);
@@ -206,6 +240,7 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
         &ScanOptions {
             root: path,
             cross_filesystems: args.cross_filesystems,
+            ignored_rules: ignored_rules.clone(),
         },
         cancellation,
         |event| progress.report(event),
@@ -214,16 +249,18 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
         &result,
         &DuplicateOptions {
             minimum_size_bytes: args.duplicate_min_size,
+            protected_rules: protected_rules.clone(),
         },
         cancellation,
         |event| progress.report(event),
     )?;
     let recommendation_total = result.items.len() as u64;
-    let findings = evaluate_with_progress(
+    let evaluation = evaluate_with_policy_progress(
         &result,
         &RuleOptions {
             large_item_threshold_bytes: args.large_threshold,
             old_item_threshold_days: args.old_days,
+            protected_rules: protected_rules.clone(),
             ..RuleOptions::default()
         },
         cancellation,
@@ -239,11 +276,27 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
     });
     progress.finish();
 
+    let policy = PolicySummary {
+        ignored_rule_count: ignored_rules.len(),
+        protected_rule_count: protected_rules.len(),
+        default_protections_enabled: !args.no_default_protections,
+        ignored_paths: result.ignored_paths.clone(),
+        protected_items: evaluation.protected_items,
+        protected_duplicate_copies: duplicates
+            .groups
+            .iter()
+            .map(|group| group.protected_file_count)
+            .sum(),
+        suppressed_recommendations: evaluation.suppressed_findings,
+    };
+    let findings = evaluation.findings;
+
     match args.format {
         OutputFormat::Human => print_human(
             &result,
             &findings,
             &duplicates,
+            &policy,
             args.top,
             args.min_size,
             theme,
@@ -254,6 +307,7 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
                 scan: result,
                 findings,
                 duplicates,
+                policy,
             })?
         ),
     }
@@ -412,6 +466,41 @@ fn expand_home(path: PathBuf) -> PathBuf {
         }
     }
     path
+}
+
+fn parse_path_rule(input: &str) -> Result<PathRule, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("path rule cannot be empty".to_owned());
+    }
+    if input.contains('*') || input.contains('?') {
+        Ok(PathRule::Glob(input.to_owned()))
+    } else {
+        Ok(PathRule::Exact(expand_home(PathBuf::from(input))))
+    }
+}
+
+fn default_protected_rules() -> Vec<PathRule> {
+    let mut paths = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    paths.extend([
+        "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/run",
+        "/sbin", "/sys", "/usr", "/var/lib", "/var/log",
+    ]
+    .into_iter()
+    .map(PathBuf::from));
+
+    #[cfg(windows)]
+    for variable in ["SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
+        if let Some(path) = env::var_os(variable).map(PathBuf::from) {
+            paths.push(path);
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths.into_iter().map(PathRule::Exact).collect()
 }
 
 fn terminal_width() -> usize {
@@ -614,6 +703,7 @@ fn print_human(
     scan: &ScanResult,
     findings: &[Finding],
     duplicates: &DuplicateReport,
+    policy: &PolicySummary,
     top: usize,
     min_size: u64,
     theme: Theme,
@@ -656,6 +746,58 @@ fn print_human(
             theme,
             "scan quality",
             theme.yellow(format!("{warning_count} items skipped or changed")),
+        );
+    }
+
+    print_section("SAFETY POLICY", theme);
+    print_metric(
+        theme,
+        "system defaults",
+        if policy.default_protections_enabled {
+            theme.green("enabled")
+        } else {
+            theme.yellow("disabled by user")
+        },
+    );
+    print_metric(
+        theme,
+        "ignored",
+        format!(
+            "{} matched paths • {} configured rules • not scanned",
+            policy.ignored_paths.len(),
+            policy.ignored_rule_count
+        ),
+    );
+    print_metric(
+        theme,
+        "protected",
+        format!(
+            "{} scanned items • {} active rules",
+            format_count(policy.protected_items),
+            policy.protected_rule_count
+        ),
+    );
+    print_metric(
+        theme,
+        "advice withheld",
+        format!(
+            "{} recommendations • {} duplicate copies",
+            format_count(policy.suppressed_recommendations),
+            format_count(policy.protected_duplicate_copies)
+        ),
+    );
+    for path in policy.ignored_paths.iter().take(5) {
+        println!(
+            "      {} {} {}",
+            theme.muted("ignored"),
+            theme.accent("•"),
+            theme.muted(display_relative(&scan.root, path))
+        );
+    }
+    if policy.ignored_paths.len() > 5 {
+        println!(
+            "      {}",
+            theme.muted(format!("… {} more ignored paths", policy.ignored_paths.len() - 5))
         );
     }
 
@@ -735,10 +877,10 @@ fn print_human(
         match duplicates.potential_recovery_allocated_bytes {
             Some(bytes) => print_metric(
                 theme,
-                "recoverable",
+                "safe recovery",
                 theme.green(format_bytes(bytes)),
             ),
-            None => print_metric(theme, "recoverable", theme.muted("unavailable")),
+            None => print_metric(theme, "safe recovery", theme.muted("unavailable")),
         }
 
         for (index, group) in duplicates.groups.iter().take(top).enumerate() {
@@ -760,7 +902,12 @@ fn print_human(
                     .file_identity
                     .map(|identity| !identities.insert(identity))
                     .unwrap_or(false);
-                let suffix = if hard_link_alias { "  [same physical file]" } else { "" };
+                let suffix = match (entry.protected, hard_link_alias) {
+                    (true, true) => "  [protected • same physical file]",
+                    (true, false) => "  [protected]",
+                    (false, true) => "  [same physical file]",
+                    (false, false) => "",
+                };
                 println!(
                     "      {} {}{}",
                     theme.accent("•"),
