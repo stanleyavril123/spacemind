@@ -1,60 +1,90 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use spacemind_core::{DuplicateReport, Finding, ItemKind, ScanResult, ScannedItem};
-use spacemind_duplicates::{detect_duplicates, DuplicateOptions};
-use spacemind_rules::{evaluate, RuleOptions};
-use spacemind_scanner::{scan, ScanOptions};
+use spacemind_core::{
+    AnalysisPhase, CancellationToken, DuplicateReport, Finding, FindingCategory, ItemKind,
+    ProgressEvent, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
+};
+use spacemind_duplicates::{detect_duplicates_with_progress, DuplicateOptions};
+use spacemind_rules::{evaluate_with_progress, RuleOptions};
+use spacemind_scanner::{scan_with_progress, ScanOptions};
 use std::collections::HashSet;
+use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Parser)]
-#[command(name = "spacemind", version, about = "Privacy-first storage analysis")]
+#[command(
+    name = "spacemind",
+    version,
+    about = "Understand what is using disk space — privately and safely",
+    long_about = "SpaceMind scans local storage, explains what is taking space, and highlights \
+                  items worth reviewing. It never deletes files automatically."
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Recursively scan a directory without modifying it.
-    Scan {
-        /// Directory to scan.
-        #[arg(default_value = ".")]
-        path: PathBuf,
-
-        /// Maximum number of large items, findings, and duplicate groups shown.
-        #[arg(long, default_value_t = 20)]
-        top: usize,
-
-        /// Hide items smaller than this size (for example: 100MB or 2GiB).
-        #[arg(long, value_parser = parse_size, default_value = "0")]
-        min_size: u64,
-
-        /// Only hash duplicate candidates at least this large.
-        #[arg(long, value_parser = parse_size, default_value = "1MiB")]
-        duplicate_min_size: u64,
-
-        /// Output format. JSON contains the complete scan, findings, and duplicates.
-        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
-        format: OutputFormat,
-
-        /// Allow traversal into mounted filesystems below the scan root.
-        #[arg(long)]
-        cross_filesystems: bool,
-
-        /// Size at which the deterministic rules flag a large item.
-        #[arg(long, value_parser = parse_size, default_value = "1GiB")]
-        large_threshold: u64,
-
-        /// Age at which archives and installers are considered old.
-        #[arg(long, default_value_t = 180)]
-        old_days: u64,
-    },
+    /// Scan a folder without modifying its contents.
+    Scan(ScanArgs),
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Args)]
+struct ScanArgs {
+    /// Folder to scan. Omit it to choose interactively.
+    path: Option<PathBuf>,
+
+    /// Maximum number of items, recommendations, and duplicate groups shown.
+    #[arg(long, default_value_t = 20)]
+    top: usize,
+
+    /// Hide items smaller than this size (for example: 100MB or 2GiB).
+    #[arg(long, value_parser = parse_size, default_value = "0")]
+    min_size: u64,
+
+    /// Only hash duplicate candidates at least this large.
+    #[arg(long, value_parser = parse_size, default_value = "1MiB")]
+    duplicate_min_size: u64,
+
+    /// Output format. JSON contains the complete analysis.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+    format: OutputFormat,
+
+    /// Allow traversal into mounted filesystems below the scan root.
+    #[arg(long)]
+    cross_filesystems: bool,
+
+    /// Size at which deterministic rules flag a large item.
+    #[arg(long, value_parser = parse_size, default_value = "1GiB")]
+    large_threshold: u64,
+
+    /// Age at which archives and installers are considered old.
+    #[arg(long, default_value_t = 180)]
+    old_days: u64,
+}
+
+impl Default for ScanArgs {
+    fn default() -> Self {
+        Self {
+            path: None,
+            top: 20,
+            min_size: 0,
+            duplicate_min_size: 1024 * 1024,
+            format: OutputFormat::Human,
+            cross_filesystems: false,
+            large_threshold: 1024 * 1024 * 1024,
+            old_days: 180,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Human,
     Json,
@@ -67,65 +97,517 @@ struct JsonOutput {
     duplicates: DuplicateReport,
 }
 
+#[derive(Clone, Copy)]
+struct Theme {
+    colors: bool,
+}
+
+impl Theme {
+    fn stdout() -> Self {
+        Self::for_terminal(io::stdout().is_terminal())
+    }
+
+    fn stderr() -> Self {
+        Self::for_terminal(io::stderr().is_terminal())
+    }
+
+    #[cfg(test)]
+    fn plain() -> Self {
+        Self { colors: false }
+    }
+
+    fn for_terminal(is_terminal: bool) -> Self {
+        let colors = is_terminal
+            && env::var_os("NO_COLOR").is_none()
+            && env::var("TERM").map(|term| term != "dumb").unwrap_or(true);
+        Self { colors }
+    }
+
+    fn paint(self, text: impl AsRef<str>, code: &str) -> String {
+        if self.colors {
+            format!("\x1b[{code}m{}\x1b[0m", text.as_ref())
+        } else {
+            text.as_ref().to_owned()
+        }
+    }
+
+    fn brand(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;255;111;97")
+    }
+
+    fn accent(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;255;105;180")
+    }
+
+    fn aqua(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;94;234;212")
+    }
+
+    fn green(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;106;219;153")
+    }
+
+    fn yellow(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;246;193;119")
+    }
+
+    fn red(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;255;107;107")
+    }
+
+    fn text(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;245;245;250")
+    }
+
+    fn muted(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "38;2;139;143;166")
+    }
+
+    fn border(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "38;2;91;84;138")
+    }
+}
+
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cancellation = CancellationToken::new();
+    let signal = cancellation.clone();
+    if let Err(error) = ctrlc::set_handler(move || signal.cancel()) {
+        eprintln!("Could not install the Ctrl+C handler: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    match run(Cli::parse(), &cancellation) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(_) if cancellation.is_cancelled() => {
+            eprintln!("Scan cancelled safely. No files were changed.");
+            ExitCode::from(130)
+        }
         Err(error) => {
-            eprintln!("error: {error}");
+            eprintln!("SpaceMind could not complete the scan: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
-    match cli.command {
-        Command::Scan {
-            path,
-            top,
-            min_size,
-            duplicate_min_size,
-            format,
-            cross_filesystems,
-            large_threshold,
-            old_days,
-        } => {
-            let result = scan(&ScanOptions {
-                root: path,
-                cross_filesystems,
-            })?;
-            let findings = evaluate(
-                &result,
-                &RuleOptions {
-                    large_item_threshold_bytes: large_threshold,
-                    old_item_threshold_days: old_days,
-                    ..RuleOptions::default()
-                },
-            );
-            let duplicates = detect_duplicates(
-                &result,
-                &DuplicateOptions {
-                    minimum_size_bytes: duplicate_min_size,
-                },
-            );
+fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>> {
+    let args = match cli.command {
+        Some(Command::Scan(args)) => args,
+        None => ScanArgs::default(),
+    };
+    let theme = Theme::stdout();
+    let path = resolve_scan_path(args.path, args.format, theme)?;
 
-            match format {
-                OutputFormat::Human => {
-                    print_human(&result, &findings, &duplicates, top, min_size)
-                }
-                OutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&JsonOutput {
-                            scan: result,
-                            findings,
-                            duplicates,
-                        })?
-                    );
-                }
-            }
-        }
+    if args.format == OutputFormat::Human && io::stdout().is_terminal() {
+        print_scan_start(&path, theme);
+    }
+
+    let mut progress = CliProgress::new();
+    let result = scan_with_progress(
+        &ScanOptions {
+            root: path,
+            cross_filesystems: args.cross_filesystems,
+        },
+        cancellation,
+        |event| progress.report(event),
+    )?;
+    let duplicates = detect_duplicates_with_progress(
+        &result,
+        &DuplicateOptions {
+            minimum_size_bytes: args.duplicate_min_size,
+        },
+        cancellation,
+        |event| progress.report(event),
+    )?;
+    let recommendation_total = result.items.len() as u64;
+    let findings = evaluate_with_progress(
+        &result,
+        &RuleOptions {
+            large_item_threshold_bytes: args.large_threshold,
+            old_item_threshold_days: args.old_days,
+            ..RuleOptions::default()
+        },
+        cancellation,
+        |event| progress.report(event),
+    )?;
+    progress.report(&ProgressEvent {
+        phase: AnalysisPhase::Complete,
+        items_processed: recommendation_total,
+        bytes_processed: result.total_size_bytes,
+        total_items: Some(recommendation_total),
+        total_bytes: Some(result.total_size_bytes),
+        current_path: None,
+    });
+    progress.finish();
+
+    match args.format {
+        OutputFormat::Human => print_human(
+            &result,
+            &findings,
+            &duplicates,
+            args.top,
+            args.min_size,
+            theme,
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&JsonOutput {
+                scan: result,
+                findings,
+                duplicates,
+            })?
+        ),
     }
     Ok(())
+}
+
+fn resolve_scan_path(
+    requested: Option<PathBuf>,
+    format: OutputFormat,
+    theme: Theme,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = requested {
+        return Ok(expand_home(path));
+    }
+
+    let current = env::current_dir()?;
+    if format == OutputFormat::Json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(current);
+    }
+
+    let home = home_directory();
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    choose_directory(&mut reader, &mut writer, current, home, theme).map_err(Into::into)
+}
+
+fn choose_directory<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    current: PathBuf,
+    home: Option<PathBuf>,
+    theme: Theme,
+) -> io::Result<PathBuf> {
+    let mut choices = vec![("Current folder".to_owned(), current)];
+    if let Some(home) = home {
+        add_directory_choice(&mut choices, "Home", home.clone());
+        add_directory_choice(&mut choices, "Downloads", home.join("Downloads"));
+        add_directory_choice(&mut choices, "Documents", home.join("Documents"));
+        add_directory_choice(&mut choices, "Desktop", home.join("Desktop"));
+    }
+
+    writeln!(writer)?;
+    write_brand_header(writer, theme, "SCAN")?;
+    writeln!(
+        writer,
+        "\n  {}  Private storage analysis, entirely on your machine.",
+        theme.accent("discover your space.")
+    )?;
+    writeln!(writer, "\n  {}", theme.aqua("Choose a folder to scan"))?;
+    writeln!(writer, "  {}", theme.border("─".repeat(terminal_width() - 4)))?;
+    for (index, (label, path)) in choices.iter().enumerate() {
+        let marker = if index == 0 {
+            theme.brand("›")
+        } else {
+            " ".to_owned()
+        };
+        writeln!(
+            writer,
+            "  {marker} {}  {}  {}",
+            theme.accent(format!("{:02}", index + 1)),
+            theme.text(format!("{label:<16}")),
+            theme.muted(path.display().to_string())
+        )?;
+    }
+    let custom_choice = choices.len() + 1;
+    writeln!(
+        writer,
+        "    {}  {}",
+        theme.accent(format!("{custom_choice:02}")),
+        theme.text("Enter another path")
+    )?;
+    writeln!(writer, "\n  {}", theme.border("─".repeat(terminal_width() - 4)))?;
+    writeln!(
+        writer,
+        "  {} select   {} current folder   {} cancel",
+        theme.accent("1–9"),
+        theme.aqua("enter"),
+        theme.muted("ctrl+c")
+    )?;
+
+    loop {
+        write!(writer, "\n  {} ", theme.brand("select ›"))?;
+        writer.flush()?;
+        let mut input = String::new();
+        if reader.read_line(&mut input)? == 0 {
+            return Ok(choices[0].1.clone());
+        }
+        let trimmed = input.trim();
+        let selected = if trimmed.is_empty() {
+            1
+        } else if let Ok(value) = trimmed.parse::<usize>() {
+            value
+        } else {
+            writeln!(
+                writer,
+                "  {} Please enter one of the numbers shown above.",
+                theme.red("!")
+            )?;
+            continue;
+        };
+
+        if let Some((_, path)) = choices.get(selected.saturating_sub(1)) {
+            return Ok(path.clone());
+        }
+        if selected != custom_choice {
+            writeln!(
+                writer,
+                "  {} Please choose a number from 1 to {custom_choice}.",
+                theme.red("!")
+            )?;
+            continue;
+        }
+
+        loop {
+            write!(writer, "  {} ", theme.brand("path ›"))?;
+            writer.flush()?;
+            let mut custom = String::new();
+            if reader.read_line(&mut custom)? == 0 {
+                return Ok(choices[0].1.clone());
+            }
+            let path = expand_home(PathBuf::from(custom.trim()));
+            if path.is_dir() {
+                return Ok(path);
+            }
+            writeln!(
+                writer,
+                "  {} That folder does not exist. Try again.",
+                theme.red("!")
+            )?;
+        }
+    }
+}
+
+fn add_directory_choice(choices: &mut Vec<(String, PathBuf)>, label: &str, path: PathBuf) {
+    if path.is_dir() && !choices.iter().any(|(_, existing)| existing == &path) {
+        choices.push((label.to_owned(), path));
+    }
+}
+
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn expand_home(path: PathBuf) -> PathBuf {
+    if path == Path::new("~") {
+        return home_directory().unwrap_or(path);
+    }
+    let mut components = path.components();
+    if components.next().is_some_and(|part| part.as_os_str() == "~") {
+        if let Some(home) = home_directory() {
+            return components.fold(home, |expanded, part| expanded.join(part.as_os_str()));
+        }
+    }
+    path
+}
+
+fn terminal_width() -> usize {
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(76)
+        .clamp(56, 96)
+}
+
+fn write_brand_header<W: Write>(writer: &mut W, theme: Theme, active: &str) -> io::Result<()> {
+    let width = terminal_width();
+    let scan = if active == "SCAN" {
+        theme.accent("scan")
+    } else {
+        theme.muted("scan")
+    };
+    let report = if active == "REPORT" {
+        theme.accent("report")
+    } else {
+        theme.muted("report")
+    };
+    let left_width = "SPACEMIND   scan   report".chars().count();
+    let right = "LOCAL • READ ONLY";
+    let padding = width.saturating_sub(left_width + right.chars().count() + 4);
+
+    writeln!(writer, "{}", theme.border(format!("╭{}╮", "─".repeat(width - 2))))?;
+    writeln!(
+        writer,
+        "{} {}   {}   {}{}{} {}",
+        theme.border("│"),
+        theme.brand("SPACEMIND"),
+        scan,
+        report,
+        " ".repeat(padding),
+        theme.green(right),
+        theme.border("│")
+    )?;
+    writeln!(writer, "{}", theme.border(format!("╰{}╯", "─".repeat(width - 2))))
+}
+
+fn print_brand_header(theme: Theme, active: &str) {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let _ = write_brand_header(&mut writer, theme, active);
+}
+
+fn print_scan_start(path: &Path, theme: Theme) {
+    print_brand_header(theme, "SCAN");
+    println!(
+        "\n  {}  Understand what is taking space without changing anything.",
+        theme.accent("storage, understood.")
+    );
+    println!("\n  {}  {}", theme.muted("target"), theme.text(path.display().to_string()));
+    println!(
+        "  {}  {}",
+        theme.muted("safety"),
+        theme.green("read-only • local only • nothing is deleted")
+    );
+    println!(
+        "  {}  {}\n",
+        theme.muted("cancel"),
+        theme.text("ctrl+c at any time")
+    );
+}
+
+struct CliProgress {
+    enabled: bool,
+    line_visible: bool,
+    last_phase: Option<AnalysisPhase>,
+    last_rendered_at: Option<Instant>,
+    last_message: Option<String>,
+    theme: Theme,
+}
+
+impl CliProgress {
+    fn new() -> Self {
+        Self {
+            enabled: io::stderr().is_terminal(),
+            line_visible: false,
+            last_phase: None,
+            last_rendered_at: None,
+            last_message: None,
+            theme: Theme::stderr(),
+        }
+    }
+
+    fn report(&mut self, event: &ProgressEvent) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let phase_changed = self.last_phase != Some(event.phase);
+        let phase_complete = event
+            .total_items
+            .is_some_and(|total| event.items_processed >= total);
+        let refresh_due = self
+            .last_rendered_at
+            .map(|last| now.duration_since(last) >= Duration::from_millis(100))
+            .unwrap_or(true);
+        if !phase_changed && !phase_complete && !refresh_due {
+            return;
+        }
+
+        let message = progress_message(event);
+        if self.last_message.as_ref() == Some(&message) {
+            return;
+        }
+        let rendered = match event.phase {
+            AnalysisPhase::Scanning => self.theme.aqua(&message),
+            AnalysisPhase::HashingDuplicates => self.theme.accent(&message),
+            AnalysisPhase::BuildingRecommendations => self.theme.yellow(&message),
+            AnalysisPhase::Complete => self.theme.green(&message),
+        };
+        eprint!("\r\x1b[2K  {rendered}");
+        let _ = io::stderr().flush();
+        self.line_visible = true;
+        self.last_phase = Some(event.phase);
+        self.last_rendered_at = Some(now);
+        self.last_message = Some(message);
+    }
+
+    fn finish(&mut self) {
+        if self.enabled && self.line_visible {
+            eprintln!();
+            self.line_visible = false;
+        }
+    }
+}
+
+impl Drop for CliProgress {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn progress_message(event: &ProgressEvent) -> String {
+    if event.phase == AnalysisPhase::Complete {
+        return format!(
+            "✓ Analysis complete    {} across {} items",
+            format_bytes(event.bytes_processed),
+            format_count(event.items_processed)
+        );
+    }
+
+    let phase = match event.phase {
+        AnalysisPhase::Scanning => "Scanning files",
+        AnalysisPhase::HashingDuplicates => "Checking duplicates",
+        AnalysisPhase::BuildingRecommendations => "Building advice",
+        AnalysisPhase::Complete => unreachable!(),
+    };
+    let progress = match event.total_items {
+        Some(total) if total > 0 => format!(
+            "{} {:>3}%  {}/{}",
+            progress_bar(event.items_processed, total, 12),
+            event.items_processed.saturating_mul(100) / total,
+            format_count(event.items_processed),
+            format_count(total)
+        ),
+        Some(_) => "[────────────]   —  0/0".to_owned(),
+        None => format!("{} items", format_count(event.items_processed)),
+    };
+    let bytes = (event.bytes_processed > 0)
+        .then(|| format!(" • {}", format_bytes(event.bytes_processed)))
+        .unwrap_or_default();
+    let path = event
+        .current_path
+        .as_ref()
+        .map(|path| format!(" • {}", compact_path(path)))
+        .unwrap_or_default();
+    format!("◐ {phase:<20} {progress}{bytes}{path}")
+}
+
+fn progress_bar(current: u64, total: u64, width: usize) -> String {
+    let filled = if total == 0 {
+        0
+    } else {
+        ((current.min(total) as u128 * width as u128) / total as u128) as usize
+    };
+    format!("[{}{}]", "━".repeat(filled), "─".repeat(width - filled))
+}
+
+fn compact_path(path: &Path) -> String {
+    let components: Vec<OsString> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let start = components.len().saturating_sub(2);
+    components[start..]
+        .iter()
+        .collect::<PathBuf>()
+        .display()
+        .to_string()
 }
 
 fn print_human(
@@ -134,17 +616,166 @@ fn print_human(
     duplicates: &DuplicateReport,
     top: usize,
     min_size: u64,
+    theme: Theme,
 ) {
-    println!("Scanned: {}", scan.root.display());
-    println!("Files: {}", scan.file_count);
-    println!("Directories: {}", scan.directory_count);
-    println!("Logical size: {}", format_bytes(scan.total_size_bytes));
-    match scan.total_allocated_size_bytes {
-        Some(size) => println!("Allocated size: {}", format_bytes(size)),
-        None => println!("Allocated size: unavailable on this platform"),
+    println!();
+    print_brand_header(theme, "REPORT");
+
+    print_section("SUMMARY", theme);
+    print_metric(theme, "location", scan.root.display().to_string());
+    print_metric(
+        theme,
+        "space analyzed",
+        format!("{} logical", format_bytes(scan.total_size_bytes)),
+    );
+    if let Some(size) = scan.total_allocated_size_bytes {
+        print_metric(
+            theme,
+            "space on disk",
+            format!("{} allocated", format_bytes(size)),
+        );
     }
-    println!("Scan warnings: {}", scan.warnings.len());
-    println!("Duplicate warnings: {}", duplicates.warnings.len());
+    print_metric(
+        theme,
+        "contents",
+        format!(
+            "{} files • {} folders",
+            format_count(scan.file_count),
+            format_count(scan.directory_count)
+        ),
+    );
+    let warning_count = scan.warnings.len() + duplicates.warnings.len();
+    if warning_count == 0 {
+        print_metric(
+            theme,
+            "scan quality",
+            theme.green("complete • no unreadable items"),
+        );
+    } else {
+        print_metric(
+            theme,
+            "scan quality",
+            theme.yellow(format!("{warning_count} items skipped or changed")),
+        );
+    }
+
+    print_section("WORTH REVIEWING", theme);
+    if findings.is_empty() {
+        println!(
+            "  {} {}",
+            theme.green("✓"),
+            theme.text("No deterministic cleanup candidates were found.")
+        );
+    } else {
+        println!(
+            "  {} {}",
+            theme.accent(format!("{} candidates", findings.len())),
+            theme.muted("• suggestions only, never automatic deletions")
+        );
+        println!();
+        for (index, finding) in findings.iter().take(top).enumerate() {
+            println!(
+                "  {}. {}  •  {}",
+                theme.brand(format!("{:02}", index + 1)),
+                theme.text(category_label(finding.category)),
+                theme.yellow(format_bytes(finding.potential_recovery_bytes))
+            );
+            println!(
+                "      {}",
+                theme.aqua(display_relative(&scan.root, &finding.path))
+            );
+            println!(
+                "      {} {}  {} {}  {}",
+                theme.muted("risk"),
+                styled_risk(theme, finding.risk),
+                theme.muted("confidence"),
+                theme.aqua(format!("{:.0}%", finding.confidence * 100.0)),
+                theme.text(action_label(finding.suggested_action))
+            );
+            if !finding.evidence.is_empty() {
+                println!(
+                    "      {} {}",
+                    theme.muted("why"),
+                    theme.muted(
+                        finding
+                            .evidence
+                            .iter()
+                            .map(|evidence| humanize_evidence(evidence))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                );
+            }
+            println!();
+        }
+        print_more(findings.len(), top, "recommendations", theme);
+    }
+
+    print_section("EXACT DUPLICATES", theme);
+    if duplicates.groups.is_empty() {
+        println!(
+            "  {} {}",
+            theme.green("✓"),
+            theme.text("No exact duplicate groups found among the files checked.")
+        );
+    } else {
+        println!(
+            "  {} {}",
+            theme.accent(format!("{} groups", duplicates.groups.len())),
+            theme.muted(format!(
+                "• {} physical files hashed",
+                format_count(duplicates.files_hashed)
+            ))
+        );
+        print_metric(
+            theme,
+            "duplicate data",
+            theme.yellow(format_bytes(duplicates.logical_duplicate_bytes)),
+        );
+        match duplicates.potential_recovery_allocated_bytes {
+            Some(bytes) => print_metric(
+                theme,
+                "recoverable",
+                theme.green(format_bytes(bytes)),
+            ),
+            None => print_metric(theme, "recoverable", theme.muted("unavailable")),
+        }
+
+        for (index, group) in duplicates.groups.iter().take(top).enumerate() {
+            println!();
+            let recovery = group
+                .potential_recovery_allocated_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".to_owned());
+            println!(
+                "  Group {}  •  {} each  •  {} physical copies  •  {} recoverable",
+                theme.brand(format!("{:02}", index + 1)),
+                theme.yellow(format_bytes(group.size_bytes_per_file)),
+                group.unique_file_count,
+                theme.green(recovery)
+            );
+            let mut identities = HashSet::new();
+            for entry in &group.entries {
+                let hard_link_alias = entry
+                    .file_identity
+                    .map(|identity| !identities.insert(identity))
+                    .unwrap_or(false);
+                let suffix = if hard_link_alias { "  [same physical file]" } else { "" };
+                println!(
+                    "      {} {}{}",
+                    theme.accent("•"),
+                    theme.aqua(display_relative(&scan.root, &entry.path)),
+                    theme.muted(suffix)
+                );
+            }
+            println!(
+                "      {} {}…",
+                theme.muted("fingerprint"),
+                theme.muted(&group.blake3_hash[..12.min(group.blake3_hash.len())])
+            );
+        }
+        print_more(duplicates.groups.len(), top, "duplicate groups", theme);
+    }
 
     let mut items: Vec<&ScannedItem> = scan
         .items
@@ -162,112 +793,161 @@ fn print_human(
             .then_with(|| left.path.cmp(&right.path))
     });
 
-    println!();
-    println!("Largest items:");
-    for item in items.into_iter().take(top) {
+    print_section("LARGEST ITEMS", theme);
+    if items.is_empty() {
+        println!("  No items matched the configured minimum size.");
+    } else {
+        for (index, item) in items.iter().take(top).enumerate() {
+            let kind = match item.kind {
+                ItemKind::Directory => "folder",
+                ItemKind::File => "file",
+                ItemKind::Symlink | ItemKind::Other => "item",
+            };
+            println!(
+                "  {}. {}  {}  {}",
+                theme.brand(format!("{:>2}", index + 1)),
+                theme.yellow(format!("{:>10}", format_bytes(item.size_bytes))),
+                theme.muted(format!("{kind:<6}")),
+                theme.text(display_relative(&scan.root, &item.path))
+            );
+        }
+        print_more(items.len(), top, "items", theme);
+    }
+
+    if warning_count > 0 {
+        print_section("SKIPPED SAFELY", theme);
         println!(
-            "{:>10}  {}",
-            format_bytes(item.size_bytes),
-            item.path.display()
+            "  {}",
+            theme.muted("These items were skipped; the rest of the scan is still usable.\n")
+        );
+        for warning in scan.warnings.iter().take(10) {
+            match &warning.path {
+                Some(path) => println!(
+                    "  {} {} — {}",
+                    theme.red("!"),
+                    theme.text(display_relative(&scan.root, path)),
+                    theme.muted(&warning.message)
+                ),
+                None => println!("  {} {}", theme.red("!"), theme.muted(&warning.message)),
+            }
+        }
+        for warning in duplicates.warnings.iter().take(10) {
+            println!(
+                "  {} {} — {}",
+                theme.red("!"),
+                theme.text(display_relative(&scan.root, &warning.path)),
+                theme.muted(&warning.message)
+            );
+        }
+        if warning_count > 20 {
+            println!("  • … and {} more warnings", warning_count - 20);
+        }
+    }
+
+    println!(
+        "\n  {} {}\n",
+        theme.green("✓"),
+        theme.green("Nothing was deleted or modified.")
+    );
+}
+
+fn print_section(title: &str, theme: Theme) {
+    let remaining = terminal_width().saturating_sub(title.chars().count() + 8);
+    println!(
+        "\n  {} {} {}",
+        theme.border("╭─"),
+        theme.accent(title.to_ascii_lowercase()),
+        theme.border(format!("{}╮", "─".repeat(remaining)))
+    );
+}
+
+fn print_metric(theme: Theme, label: &str, value: impl AsRef<str>) {
+    println!(
+        "  {}  {}",
+        theme.muted(format!("{label:<17}")),
+        theme.text(value)
+    );
+}
+
+fn print_more(total: usize, shown: usize, label: &str, theme: Theme) {
+    if total > shown {
+        println!(
+            "  {}",
+            theme.muted(format!("… {} more {label} hidden by --top", total - shown))
         );
     }
+}
 
-    println!();
-    println!("Exact duplicate groups: {}", duplicates.groups.len());
-    println!(
-        "Logical duplicate bytes: {}",
-        format_bytes(duplicates.logical_duplicate_bytes)
-    );
-    match duplicates.potential_recovery_allocated_bytes {
-        Some(bytes) => println!("Potential duplicate recovery: {}", format_bytes(bytes)),
-        None => println!("Potential duplicate recovery: unavailable on this platform"),
-    }
-    println!(
-        "Hashed: {} physical files ({})",
-        duplicates.files_hashed,
-        format_bytes(duplicates.bytes_hashed)
-    );
-    for group in duplicates.groups.iter().take(top) {
-        println!();
-        match group.potential_recovery_allocated_bytes {
-            Some(bytes) => println!(
-                "{:>10} recoverable  {} each  {} physical copies",
-                format_bytes(bytes),
-                format_bytes(group.size_bytes_per_file),
-                group.unique_file_count
-            ),
-            None => println!(
-                " unavailable recoverable  {} each  {} physical copies",
-                format_bytes(group.size_bytes_per_file),
-                group.unique_file_count
-            ),
-        }
-        println!("            BLAKE3 {}", group.blake3_hash);
-        let mut identities = HashSet::new();
-        for entry in group.entries.iter().take(top) {
-            let hard_link_alias = entry
-                .file_identity
-                .map(|identity| !identities.insert(identity))
-                .unwrap_or(false);
-            if hard_link_alias {
-                println!("            - {} [hard-link alias]", entry.path.display());
-            } else {
-                println!("            - {}", entry.path.display());
-            }
-        }
-        if group.entries.len() > top {
-            println!(
-                "            - ... {} more paths",
-                group.entries.len() - top
-            );
-        }
-    }
+fn display_relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
 
-    if !findings.is_empty() {
-        println!();
-        println!("Deterministic findings:");
-        for finding in findings.iter().take(top) {
-            println!(
-                "{:>10}  {:?}  {}",
-                format_bytes(finding.potential_recovery_bytes),
-                finding.category,
-                finding.path.display()
-            );
-            for evidence in &finding.evidence {
-                println!("              - {evidence}");
-            }
-        }
+fn category_label(category: FindingCategory) -> &'static str {
+    match category {
+        FindingCategory::LargeItem => "Large item",
+        FindingCategory::OldArchive => "Old archive",
+        FindingCategory::OldInstaller => "Old installer",
+        FindingCategory::GeneratedDirectory => "Generated build folder",
+        FindingCategory::CacheDirectory => "Cache folder",
     }
+}
 
-    if !scan.warnings.is_empty() {
-        println!();
-        println!("Scan warnings:");
-        for warning in scan.warnings.iter().take(20) {
-            match &warning.path {
-                Some(path) => println!("- {}: {}", path.display(), warning.message),
-                None => println!("- {}", warning.message),
-            }
-        }
-        if scan.warnings.len() > 20 {
-            println!("- ... {} more warnings", scan.warnings.len() - 20);
-        }
+fn risk_label(risk: RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::Low => "Low",
+        RiskLevel::Medium => "Medium",
+        RiskLevel::High => "High",
     }
+}
 
-    if !duplicates.warnings.is_empty() {
-        println!();
-        println!("Duplicate detection warnings:");
-        for warning in duplicates.warnings.iter().take(20) {
-            println!(
-                "- {} ({:?}): {}",
-                warning.path.display(),
-                warning.kind,
-                warning.message
-            );
-        }
-        if duplicates.warnings.len() > 20 {
-            println!("- ... {} more warnings", duplicates.warnings.len() - 20);
-        }
+fn styled_risk(theme: Theme, risk: RiskLevel) -> String {
+    match risk {
+        RiskLevel::Low => theme.green(risk_label(risk)),
+        RiskLevel::Medium => theme.yellow(risk_label(risk)),
+        RiskLevel::High => theme.red(risk_label(risk)),
     }
+}
+
+fn action_label(action: SuggestedAction) -> &'static str {
+    match action {
+        SuggestedAction::ReviewForDeletion => "Review before deleting",
+        SuggestedAction::ReviewForArchive => "Review for archiving",
+    }
+}
+
+fn humanize_evidence(evidence: &str) -> String {
+    if let Some(bytes) = evidence
+        .strip_prefix("Item is at least ")
+        .and_then(|value| value.strip_suffix(" bytes, the configured large-item threshold"))
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return format!("Larger than the configured {} threshold", format_bytes(bytes));
+    }
+    if let Some(bytes) = evidence
+        .strip_prefix("Directory occupies ")
+        .and_then(|value| value.strip_suffix(" bytes"))
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return format!("Folder contains {} of data", format_bytes(bytes));
+    }
+    evidence.to_owned()
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    formatted
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -320,6 +1000,7 @@ fn parse_size(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn parses_decimal_and_binary_sizes() {
@@ -331,5 +1012,70 @@ mod tests {
     #[test]
     fn rejects_unknown_size_suffixes() {
         assert!(parse_size("12 elephants").is_err());
+    }
+
+    #[test]
+    fn formats_progress_with_known_totals() {
+        let event = ProgressEvent {
+            phase: AnalysisPhase::HashingDuplicates,
+            items_processed: 2,
+            bytes_processed: 1024,
+            total_items: Some(4),
+            total_bytes: Some(4096),
+            current_path: Some(PathBuf::from("folder/example.bin")),
+        };
+
+        assert_eq!(
+            progress_message(&event),
+            "◐ Checking duplicates  [━━━━━━──────]  50%  2/4 • 1.0 KiB • folder/example.bin"
+        );
+    }
+
+    #[test]
+    fn formats_counts_with_thousands_separators() {
+        assert_eq!(format_count(12), "12");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn colors_are_optional_and_reset_after_styled_text() {
+        assert_eq!(Theme::plain().accent("SpaceMind"), "SpaceMind");
+
+        let colored = Theme { colors: true }.brand("SpaceMind");
+        assert!(colored.starts_with("\x1b["));
+        assert!(colored.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn selector_defaults_to_the_current_directory() {
+        let current = env::temp_dir();
+        let mut input = Cursor::new("\n");
+        let mut output = Vec::new();
+
+        let selected = choose_directory(
+            &mut input,
+            &mut output,
+            current.clone(),
+            None,
+            Theme::plain(),
+        )
+        .unwrap();
+
+        assert_eq!(selected, current);
+        assert!(String::from_utf8(output).unwrap().contains("Choose a folder to scan"));
+    }
+
+    #[test]
+    fn makes_rule_evidence_readable() {
+        assert_eq!(
+            humanize_evidence(
+                "Item is at least 1073741824 bytes, the configured large-item threshold"
+            ),
+            "Larger than the configured 1.0 GiB threshold"
+        );
+        assert_eq!(
+            humanize_evidence("Directory occupies 1822195905 bytes"),
+            "Folder contains 1.7 GiB of data"
+        );
     }
 }
