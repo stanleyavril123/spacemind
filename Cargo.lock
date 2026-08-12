@@ -295,6 +295,7 @@ dependencies = [
  "serde_json",
  "spacemind-core",
  "spacemind-duplicates",
+ "spacemind-relationships",
  "spacemind-rules",
  "spacemind-scanner",
 ]
@@ -315,6 +316,14 @@ dependencies = [
  "spacemind-scanner",
  "thiserror",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "spacemind-relationships"
+version = "0.1.0"
+dependencies = [
+ "spacemind-core",
+ "thiserror",
 ]
 
 [[package]]

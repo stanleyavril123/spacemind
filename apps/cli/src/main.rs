@@ -2,9 +2,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use spacemind_core::{
     AnalysisPhase, CancellationToken, DuplicateReport, Finding, FindingCategory, ItemKind,
-    PathRule, ProgressEvent, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
+    PathRule, ProgressEvent, RelationshipKind, RelationshipReport, RiskLevel, ScanResult,
+    ScannedItem, SuggestedAction,
 };
 use spacemind_duplicates::{detect_duplicates_with_progress, DuplicateOptions};
+use spacemind_relationships::{
+    detect_relationships_with_progress, enrich_findings_with_relationships,
+};
 use spacemind_rules::{evaluate_with_policy_progress, RuleOptions};
 use spacemind_scanner::{scan_with_progress, ScanOptions};
 use std::collections::HashSet;
@@ -110,6 +114,7 @@ struct JsonOutput {
     scan: ScanResult,
     findings: Vec<Finding>,
     duplicates: DuplicateReport,
+    relationships: RelationshipReport,
     policy: PolicySummary,
 }
 
@@ -254,6 +259,12 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
         cancellation,
         |event| progress.report(event),
     )?;
+    let relationships = detect_relationships_with_progress(
+        &result,
+        &duplicates,
+        cancellation,
+        |event| progress.report(event),
+    )?;
     let recommendation_total = result.items.len() as u64;
     let evaluation = evaluate_with_policy_progress(
         &result,
@@ -289,13 +300,15 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
             .sum(),
         suppressed_recommendations: evaluation.suppressed_findings,
     };
-    let findings = evaluation.findings;
+    let mut findings = evaluation.findings;
+    enrich_findings_with_relationships(&mut findings, &relationships);
 
     match args.format {
         OutputFormat::Human => print_human(
             &result,
             &findings,
             &duplicates,
+            &relationships,
             &policy,
             args.top,
             args.min_size,
@@ -307,6 +320,7 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
                 scan: result,
                 findings,
                 duplicates,
+                relationships,
                 policy,
             })?
         ),
@@ -613,6 +627,7 @@ impl CliProgress {
             AnalysisPhase::Scanning => self.theme.aqua(&message),
             AnalysisPhase::HashingDuplicates => self.theme.accent(&message),
             AnalysisPhase::BuildingRecommendations => self.theme.yellow(&message),
+            AnalysisPhase::DetectingRelationships => self.theme.aqua(&message),
             AnalysisPhase::Complete => self.theme.green(&message),
         };
         eprint!("\r\x1b[2K  {rendered}");
@@ -650,6 +665,7 @@ fn progress_message(event: &ProgressEvent) -> String {
         AnalysisPhase::Scanning => "Scanning files",
         AnalysisPhase::HashingDuplicates => "Checking duplicates",
         AnalysisPhase::BuildingRecommendations => "Building advice",
+        AnalysisPhase::DetectingRelationships => "Connecting context",
         AnalysisPhase::Complete => unreachable!(),
     };
     let progress = match event.total_items {
@@ -703,6 +719,7 @@ fn print_human(
     scan: &ScanResult,
     findings: &[Finding],
     duplicates: &DuplicateReport,
+    relationships: &RelationshipReport,
     policy: &PolicySummary,
     top: usize,
     min_size: u64,
@@ -851,6 +868,50 @@ fn print_human(
             println!();
         }
         print_more(findings.len(), top, "recommendations", theme);
+    }
+
+    print_section("RELATED ITEMS", theme);
+    if relationships.relationships.is_empty() {
+        println!(
+            "  {} {}",
+            theme.green("✓"),
+            theme.text("No deterministic item relationships were found.")
+        );
+    } else {
+        println!(
+            "  {} {}",
+            theme.accent(format!("{} connections", relationships.relationships.len())),
+            theme.muted("• evidence only, never deletion authorization")
+        );
+        println!();
+        for (index, relationship) in relationships.relationships.iter().take(top).enumerate() {
+            println!(
+                "  {}. {}  •  {} confidence",
+                theme.brand(format!("{:02}", index + 1)),
+                theme.text(relationship_kind_label(relationship.kind)),
+                theme.aqua(format!("{:.0}%", relationship.confidence * 100.0))
+            );
+            println!(
+                "      {} {} {}",
+                theme.aqua(display_relative(&scan.root, &relationship.source_path)),
+                theme.accent("↔"),
+                theme.aqua(display_relative(&scan.root, &relationship.target_path))
+            );
+            if !relationship.evidence.is_empty() {
+                println!(
+                    "      {} {}",
+                    theme.muted("why"),
+                    theme.muted(relationship.evidence.join("; "))
+                );
+            }
+            println!();
+        }
+        print_more(
+            relationships.relationships.len(),
+            top,
+            "relationships",
+            theme,
+        );
     }
 
     print_section("EXACT DUPLICATES", theme);
@@ -1032,6 +1093,17 @@ fn display_relative(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+fn relationship_kind_label(kind: RelationshipKind) -> &'static str {
+    match kind {
+        RelationshipKind::ArchiveExtractedDirectory => "Archive and extracted folder",
+        RelationshipKind::InstallerApplicationDirectory => "Installer and application folder",
+        RelationshipKind::BuildDirectoryProject => "Build output and source project",
+        RelationshipKind::VirtualMachineComponent => "Virtual-machine components",
+        RelationshipKind::AndroidEmulatorConfiguration => "Android emulator configuration",
+        RelationshipKind::ExactDuplicate => "Exact duplicate files",
+    }
 }
 
 fn category_label(category: FindingCategory) -> &'static str {

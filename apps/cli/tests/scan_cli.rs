@@ -114,6 +114,67 @@ fn applies_ignore_and_protect_rules_end_to_end() {
 }
 
 #[test]
+fn emits_specific_deterministic_categories_in_json() {
+    let directory = TestDirectory::new();
+    let project = directory.0.join("project");
+    let target = project.join("target");
+    let dependencies = project.join("node_modules");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir(&dependencies).unwrap();
+    fs::write(project.join("Cargo.toml"), b"[package]\nname = \"example\"").unwrap();
+    fs::write(target.join("artifact.bin"), [1_u8; 17]).unwrap();
+    fs::write(dependencies.join("package.js"), [2_u8; 19]).unwrap();
+    fs::write(directory.0.join("machine.qcow2"), [3_u8; 23]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .args([
+            "scan",
+            directory.0.to_str().unwrap(),
+            "--format",
+            "json",
+            "--large-threshold",
+            "1GiB",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let categories = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|finding| finding["category"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(categories.contains(&"rust_build_artifacts"));
+    assert!(categories.contains(&"node_modules"));
+    assert!(categories.contains(&"virtual_machine"));
+
+    let relationship_kinds = json["relationships"]["relationships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|relationship| relationship["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert!(relationship_kinds.contains(&"build_directory_project"));
+
+    let rust_finding = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["category"] == "rust_build_artifacts")
+        .unwrap();
+    assert!(rust_finding["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|evidence| evidence
+            .as_str()
+            .is_some_and(|value| value.starts_with("Source project:"))));
+}
+
+#[test]
 fn zero_argument_launch_scans_the_current_directory_without_a_terminal() {
     let directory = TestDirectory::new();
     fs::write(directory.0.join("example.bin"), [7_u8; 16]).unwrap();
