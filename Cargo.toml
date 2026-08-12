@@ -23,6 +23,7 @@ crossterm = "=0.27.0"
 serde = { version = "=1.0.197", features = ["derive"] }
 serde_json = "=1.0.115"
 thiserror = "=1.0.58"
+unicode-width = "=0.2.0"
 walkdir = "=2.5.0"
 windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 spacemind-core = { path = "crates/spacemind-core" }

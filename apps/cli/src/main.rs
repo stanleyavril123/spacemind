@@ -23,6 +23,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -157,12 +158,14 @@ impl Theme {
     }
 
     fn for_terminal(is_terminal: bool) -> Self {
-        let colors = is_terminal
-            && env::var_os("NO_COLOR").is_none()
-            && env::var("TERM").map(|term| term != "dumb").unwrap_or(true);
+        let terminal = is_terminal
+            && env::var("TERM")
+                .map(|term| term != "dumb")
+                .unwrap_or(true);
+        let colors = terminal && env::var_os("NO_COLOR").is_none();
         Self {
             colors,
-            terminal: is_terminal,
+            terminal,
         }
     }
 
@@ -435,7 +438,11 @@ fn resolve_scan_path(
     }
 
     let current = env::current_dir()?;
-    if format == OutputFormat::Json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    if format == OutputFormat::Json
+        || !io::stdin().is_terminal()
+        || !io::stdout().is_terminal()
+        || !theme.terminal
+    {
         return Ok(current);
     }
 
@@ -601,71 +608,14 @@ fn render_directory_selector<W: Write>(
     theme: Theme,
 ) -> io::Result<()> {
     let layout = terminal_layout(theme);
-    let mut lines = brand_header_lines(theme, "SCAN").to_vec();
-    lines.push(String::new());
-    lines.push(format!(
-        "  {}  {}",
-        theme.accent("storage, understood."),
-        theme.muted("Private analysis on this computer.")
-    ));
-    lines.push(String::new());
-    lines.push(format!("  {}", theme.text("Choose a folder to scan")));
-    lines.push(format!(
-        "  {}",
-        theme.border("─".repeat(layout.width.saturating_sub(4)))
-    ));
-
-    let path_width = layout.width.saturating_sub(29);
-    for (index, (label, path)) in choices.iter().enumerate() {
-        let choice = format!(" {:02}  {label:<16} ", index + 1);
-        let choice = if selected == index {
-            theme.selected(choice)
-        } else {
-            theme.text(choice)
-        };
-        lines.push(format!(
-            "  {choice}  {}",
-            theme.muted(truncate_start(&path.display().to_string(), path_width))
-        ));
-    }
-
-    let custom_index = choices.len();
-    let custom_choice = format!(" {:02}  {:<16} ", custom_index + 1, "Custom path");
-    let custom_choice = if selected == custom_index {
-        theme.selected(custom_choice)
-    } else {
-        theme.text(custom_choice)
-    };
-    lines.push(format!("  {custom_choice}  {}", theme.muted("enter any folder")));
-    lines.push(String::new());
-    lines.push(format!(
-        "  {}",
-        theme.border("─".repeat(layout.width.saturating_sub(4)))
-    ));
-
-    if let Some(input) = custom_input {
-        lines.push(format!(
-            "  {} {}",
-            theme.accent("path ›"),
-            theme.text(format!("{input}▌"))
-        ));
-        lines.push(format!(
-            "  {} accept    {} go back",
-            theme.text("enter"),
-            theme.muted("esc")
-        ));
-    } else {
-        lines.push(format!(
-            "  {} move    {} scan    {} custom    {} quit",
-            theme.text("↑/↓  j/k"),
-            theme.text("enter"),
-            theme.accent("c"),
-            theme.muted("q")
-        ));
-    }
-    if let Some(message) = message {
-        lines.push(format!("  {} {}", theme.red("!"), theme.muted(message)));
-    }
+    let lines = directory_selector_lines(
+        choices,
+        selected,
+        custom_input,
+        message,
+        theme,
+        layout,
+    );
 
     execute!(writer, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
     let top = layout.selector_top_padding(lines.len());
@@ -677,6 +627,107 @@ fn render_directory_selector<W: Write>(
         )?;
     }
     writer.flush()
+}
+
+fn directory_selector_lines(
+    choices: &[(String, PathBuf)],
+    selected: usize,
+    custom_input: Option<&str>,
+    message: Option<&str>,
+    theme: Theme,
+    layout: TerminalLayout,
+) -> Vec<String> {
+    let mut lines = brand_header_lines_for_width(theme, "SCAN", layout.width).to_vec();
+    lines.push(String::new());
+
+    let tagline = "storage, understood.  Private analysis on this computer.";
+    lines.push(format!(
+        "  {}",
+        theme.accent(truncate_end(tagline, layout.width.saturating_sub(2)))
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.text(truncate_end(
+            "Choose a folder to scan",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+
+    let label_width = layout.width.saturating_sub(16).clamp(4, 16);
+    let path_width = layout.width.saturating_sub(12 + label_width);
+    for (index, (label, path)) in choices.iter().enumerate() {
+        let marker = if selected == index { "›" } else { " " };
+        let label = pad_right(label, label_width);
+        let choice = format!(" {:02}  {label} ", index + 1);
+        let choice = if selected == index {
+            theme.selected(choice)
+        } else {
+            theme.text(choice)
+        };
+        let path = truncate_start(&path.display().to_string(), path_width);
+        lines.push(format!(
+            "  {} {choice}  {}",
+            theme.accent(marker),
+            theme.muted(path)
+        ));
+    }
+
+    let custom_index = choices.len();
+    let marker = if selected == custom_index { "›" } else { " " };
+    let custom_label = pad_right("Custom path", label_width);
+    let custom_choice = format!(" {:02}  {custom_label} ", custom_index + 1);
+    let custom_choice = if selected == custom_index {
+        theme.selected(custom_choice)
+    } else {
+        theme.text(custom_choice)
+    };
+    let custom_hint = truncate_end("enter any folder", path_width);
+    lines.push(format!(
+        "  {} {custom_choice}  {}",
+        theme.accent(marker),
+        theme.muted(custom_hint)
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+
+    if let Some(input) = custom_input {
+        let prefix = "  path › ";
+        let available = layout.width.saturating_sub(display_width(prefix));
+        let input = truncate_start(&format!("{input}▌"), available);
+        lines.push(format!(
+            "  {} {}",
+            theme.accent("path ›"),
+            theme.text(input)
+        ));
+        let help = truncate_end(
+            "enter accept    esc go back",
+            layout.width.saturating_sub(2),
+        );
+        lines.push(format!("  {}", theme.muted(help)));
+    } else {
+        let full_help = "↑/↓  j/k move    enter scan    c custom    q quit";
+        let compact_help = "j/k move  enter scan  q quit";
+        let available = layout.width.saturating_sub(2);
+        let help = if display_width(full_help) <= available {
+            full_help.to_owned()
+        } else {
+            truncate_end(compact_help, available)
+        };
+        lines.push(format!("  {}", theme.muted(help)));
+    }
+    if let Some(message) = message {
+        let message = truncate_end(message, layout.width.saturating_sub(4));
+        lines.push(format!("  {} {}", theme.red("!"), theme.muted(message)));
+    }
+    lines
 }
 
 struct RawModeGuard;
@@ -760,25 +811,37 @@ fn default_protected_rules() -> Vec<PathRule> {
 }
 
 fn brand_header_lines(theme: Theme, active: &str) -> [String; 3] {
-    let width = terminal_width(theme);
-    let scan = if active == "SCAN" {
-        theme.selected(" scan ")
+    brand_header_lines_for_width(theme, active, terminal_width(theme))
+}
+
+fn brand_header_lines_for_width(theme: Theme, active: &str, width: usize) -> [String; 3] {
+    let scan_label = if active == "SCAN" { "[scan]" } else { " scan " };
+    let report_label = if active == "REPORT" {
+        "[report]"
     } else {
-        theme.muted(" scan ")
+        " report "
+    };
+    let scan = if active == "SCAN" {
+        theme.selected(scan_label)
+    } else {
+        theme.muted(scan_label)
     };
     let report = if active == "REPORT" {
-        theme.selected(" report ")
+        theme.selected(report_label)
     } else {
-        theme.muted(" report ")
+        theme.muted(report_label)
     };
-    let right = "local / read only";
-    let fixed_width = " SPACEMIND    scan     report ".chars().count() + right.chars().count() + 1;
-    let padding = width.saturating_sub(fixed_width + 2);
+    let interior_width = width.saturating_sub(2);
+    let full_left_width = display_width(" SPACEMIND   ")
+        + display_width(scan_label)
+        + 3
+        + display_width(report_label);
+    let right = "local / read only ";
 
-    [
-        theme.border(format!("┌{}┐", "─".repeat(width.saturating_sub(2)))),
+    let middle = if full_left_width + 1 + display_width(right) <= interior_width {
+        let padding = interior_width - full_left_width - display_width(right);
         format!(
-            "{} {}   {}   {}{}{} {}",
+            "{} {}   {}   {}{}{}{}",
             theme.border("│"),
             theme.brand("SPACEMIND"),
             scan,
@@ -786,7 +849,37 @@ fn brand_header_lines(theme: Theme, active: &str) -> [String; 3] {
             " ".repeat(padding),
             theme.muted(right),
             theme.border("│")
-        ),
+        )
+    } else {
+        let active_label = format!("[{}]", active.to_ascii_lowercase());
+        let compact_width = display_width(" SPACEMIND   ") + display_width(&active_label);
+        if compact_width <= interior_width {
+            let padding = interior_width - compact_width;
+            format!(
+                "{} {}   {}{}{}",
+                theme.border("│"),
+                theme.brand("SPACEMIND"),
+                theme.selected(active_label),
+                " ".repeat(padding),
+                theme.border("│")
+            )
+        } else {
+            let content = pad_right(
+                &truncate_end(" SPACEMIND", interior_width),
+                interior_width,
+            );
+            format!(
+                "{}{}{}",
+                theme.border("│"),
+                theme.brand(content),
+                theme.border("│")
+            )
+        }
+    };
+
+    [
+        theme.border(format!("┌{}┐", "─".repeat(width.saturating_sub(2)))),
+        middle,
         theme.border(format!("└{}┘", "─".repeat(width.saturating_sub(2)))),
     ]
 }
@@ -965,19 +1058,74 @@ fn compact_path(path: &Path) -> String {
 }
 
 fn truncate_start(value: &str, maximum_width: usize) -> String {
-    let length = value.chars().count();
-    if length <= maximum_width {
+    if display_width(value) <= maximum_width {
         return value.to_owned();
     }
-    if maximum_width <= 1 {
-        return "…".chars().take(maximum_width).collect();
+    if maximum_width == 0 {
+        return String::new();
     }
 
-    let visible_tail = value
-        .chars()
-        .skip(length - (maximum_width - 1))
-        .collect::<String>();
+    let tail_width = maximum_width.saturating_sub(display_width("…"));
+    let mut used = 0;
+    let mut visible_tail = Vec::new();
+    for character in value.chars().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > tail_width {
+            break;
+        }
+        used += character_width;
+        visible_tail.push(character);
+    }
+    visible_tail.reverse();
+    let visible_tail = visible_tail.into_iter().collect::<String>();
     format!("…{visible_tail}")
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn pad_right(value: &str, width: usize) -> String {
+    let value = truncate_end(value, width);
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(display_width(&value)))
+    )
+}
+
+fn truncate_end(value: &str, maximum_width: usize) -> String {
+    if display_width(value) <= maximum_width {
+        return value.to_owned();
+    }
+    if maximum_width == 0 {
+        return String::new();
+    }
+
+    let content_width = maximum_width.saturating_sub(display_width("…"));
+    let mut used = 0;
+    let mut visible = String::new();
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > content_width {
+            break;
+        }
+        used += character_width;
+        visible.push(character);
+    }
+    visible.push('…');
+    visible
+}
+
+fn warning_display_counts(
+    scan_warnings: usize,
+    duplicate_warnings: usize,
+) -> (usize, usize, usize) {
+    let shown_scan = scan_warnings.min(10);
+    let shown_duplicates = duplicate_warnings.min(10);
+    let hidden = scan_warnings
+        .saturating_sub(shown_scan)
+        .saturating_add(duplicate_warnings.saturating_sub(shown_duplicates));
+    (shown_scan, shown_duplicates, hidden)
 }
 
 fn print_human(
@@ -1427,7 +1575,9 @@ fn print_human(
             theme.muted("These items were skipped; the rest of the scan is still usable.")
         );
         ui_println!(theme);
-        for warning in scan.warnings.iter().take(10) {
+        let (shown_scan_warnings, shown_duplicate_warnings, hidden_warnings) =
+            warning_display_counts(scan.warnings.len(), duplicates.warnings.len());
+        for warning in scan.warnings.iter().take(shown_scan_warnings) {
             match &warning.path {
                 Some(path) => ui_println!(
                     theme,
@@ -1444,7 +1594,11 @@ fn print_human(
                 ),
             }
         }
-        for warning in duplicates.warnings.iter().take(10) {
+        for warning in duplicates
+            .warnings
+            .iter()
+            .take(shown_duplicate_warnings)
+        {
             ui_println!(
                 theme,
                 "  {} {} — {}",
@@ -1453,8 +1607,8 @@ fn print_human(
                 theme.muted(&warning.message)
             );
         }
-        if warning_count > 20 {
-            ui_println!(theme, "  • … and {} more warnings", warning_count - 20);
+        if hidden_warnings > 0 {
+            ui_println!(theme, "  • … and {hidden_warnings} more warnings");
         }
     }
 
@@ -1618,20 +1772,17 @@ fn wrap_text(value: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in value.split_whitespace() {
-        let word_length = word.chars().count();
-        if word_length > width {
+        let word_width = display_width(word);
+        if word_width > width {
             if !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
             }
-            let characters = word.chars().collect::<Vec<_>>();
-            for chunk in characters.chunks(width) {
-                lines.push(chunk.iter().collect());
-            }
+            lines.extend(split_by_display_width(word, width));
             continue;
         }
 
         let separator = usize::from(!current.is_empty());
-        if current.chars().count() + separator + word_length > width {
+        if display_width(&current) + separator + word_width > width {
             lines.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
@@ -1643,6 +1794,26 @@ fn wrap_text(value: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+fn split_by_display_width(value: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if !current.is_empty() && current_width + character_width > width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(character);
+        current_width += character_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn print_metric(theme: Theme, label: &str, value: &str, tone: RecordTone) {
@@ -1882,6 +2053,26 @@ mod tests {
     }
 
     #[test]
+    fn keeps_header_and_selector_lines_inside_a_small_canvas() {
+        let layout = TerminalLayout::for_size(32, 24);
+        let choices = vec![(
+            "Current folder".to_owned(),
+            PathBuf::from("/a/very/long/path/to/a/folder"),
+        )];
+        let lines = directory_selector_lines(
+            &choices,
+            0,
+            Some("/another/very/long/custom/path"),
+            Some("That folder does not exist. Check the path and try again."),
+            Theme::plain(),
+            layout,
+        );
+
+        assert!(lines.iter().all(|line| display_width(line) <= layout.width));
+        assert!(lines[1].contains("[scan]"));
+    }
+
+    #[test]
     fn selector_lists_the_current_directory_first() {
         let current = env::temp_dir();
         let choices = directory_choices(current.clone(), None);
@@ -1900,12 +2091,23 @@ mod tests {
         assert!(output.contains("Choose a folder to scan"));
         assert!(output.contains("Custom path"));
         assert!(output.contains("j/k"));
+        assert!(output.contains("›  01"));
     }
 
     #[test]
-    fn truncates_long_paths_from_the_start() {
+    fn truncates_paths_using_terminal_column_width() {
         assert_eq!(truncate_start("/one/two/three", 10), "…two/three");
         assert_eq!(truncate_start("short", 10), "short");
+        assert_eq!(display_width("文件"), 4);
+        assert_eq!(truncate_start("/文件", 4), "…件");
+        assert_eq!(truncate_end("文件/report", 4), "文…");
+    }
+
+    #[test]
+    fn reports_every_hidden_warning() {
+        assert_eq!(warning_display_counts(11, 0), (10, 0, 1));
+        assert_eq!(warning_display_counts(15, 2), (10, 2, 5));
+        assert_eq!(warning_display_counts(15, 12), (10, 10, 7));
     }
 
     #[test]
