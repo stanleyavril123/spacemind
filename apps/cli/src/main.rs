@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use spacemind_core::{Finding, ItemKind, ScanResult, ScannedItem};
+use spacemind_core::{DuplicateReport, Finding, ItemKind, ScanResult, ScannedItem};
+use spacemind_duplicates::{detect_duplicates, DuplicateOptions};
 use spacemind_rules::{evaluate, RuleOptions};
 use spacemind_scanner::{scan, ScanOptions};
+use std::collections::HashSet;
 use std::error::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -22,7 +24,7 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Maximum number of large items shown in human output.
+        /// Maximum number of large items, findings, and duplicate groups shown.
         #[arg(long, default_value_t = 20)]
         top: usize,
 
@@ -30,7 +32,11 @@ enum Command {
         #[arg(long, value_parser = parse_size, default_value = "0")]
         min_size: u64,
 
-        /// Output format. JSON contains the complete scan and all findings.
+        /// Only hash duplicate candidates at least this large.
+        #[arg(long, value_parser = parse_size, default_value = "1MiB")]
+        duplicate_min_size: u64,
+
+        /// Output format. JSON contains the complete scan, findings, and duplicates.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         format: OutputFormat,
 
@@ -58,6 +64,7 @@ enum OutputFormat {
 struct JsonOutput {
     scan: ScanResult,
     findings: Vec<Finding>,
+    duplicates: DuplicateReport,
 }
 
 fn main() -> ExitCode {
@@ -76,6 +83,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             path,
             top,
             min_size,
+            duplicate_min_size,
             format,
             cross_filesystems,
             large_threshold,
@@ -93,15 +101,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     ..RuleOptions::default()
                 },
             );
+            let duplicates = detect_duplicates(
+                &result,
+                &DuplicateOptions {
+                    minimum_size_bytes: duplicate_min_size,
+                },
+            );
 
             match format {
-                OutputFormat::Human => print_human(&result, &findings, top, min_size),
+                OutputFormat::Human => {
+                    print_human(&result, &findings, &duplicates, top, min_size)
+                }
                 OutputFormat::Json => {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&JsonOutput {
                             scan: result,
                             findings,
+                            duplicates,
                         })?
                     );
                 }
@@ -111,12 +128,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn print_human(scan: &ScanResult, findings: &[Finding], top: usize, min_size: u64) {
+fn print_human(
+    scan: &ScanResult,
+    findings: &[Finding],
+    duplicates: &DuplicateReport,
+    top: usize,
+    min_size: u64,
+) {
     println!("Scanned: {}", scan.root.display());
     println!("Files: {}", scan.file_count);
     println!("Directories: {}", scan.directory_count);
-    println!("Total size: {}", format_bytes(scan.total_size_bytes));
-    println!("Warnings: {}", scan.warnings.len());
+    println!("Logical size: {}", format_bytes(scan.total_size_bytes));
+    match scan.total_allocated_size_bytes {
+        Some(size) => println!("Allocated size: {}", format_bytes(size)),
+        None => println!("Allocated size: unavailable on this platform"),
+    }
+    println!("Scan warnings: {}", scan.warnings.len());
+    println!("Duplicate warnings: {}", duplicates.warnings.len());
 
     let mut items: Vec<&ScannedItem> = scan
         .items
@@ -137,7 +165,51 @@ fn print_human(scan: &ScanResult, findings: &[Finding], top: usize, min_size: u6
     println!();
     println!("Largest items:");
     for item in items.into_iter().take(top) {
-        println!("{:>10}  {}", format_bytes(item.size_bytes), item.path.display());
+        println!(
+            "{:>10}  {}",
+            format_bytes(item.size_bytes),
+            item.path.display()
+        );
+    }
+
+    println!();
+    println!("Exact duplicate groups: {}", duplicates.groups.len());
+    println!(
+        "Potential duplicate recovery: {}",
+        format_bytes(duplicates.potential_recovery_bytes)
+    );
+    println!(
+        "Hashed: {} physical files ({})",
+        duplicates.files_hashed,
+        format_bytes(duplicates.bytes_hashed)
+    );
+    for group in duplicates.groups.iter().take(top) {
+        println!();
+        println!(
+            "{:>10} recoverable  {} each  {} physical copies",
+            format_bytes(group.potential_recovery_bytes),
+            format_bytes(group.size_bytes_per_file),
+            group.unique_file_count
+        );
+        println!("            BLAKE3 {}", group.blake3_hash);
+        let mut identities = HashSet::new();
+        for entry in group.entries.iter().take(top) {
+            let hard_link_alias = entry
+                .file_identity
+                .map(|identity| !identities.insert(identity))
+                .unwrap_or(false);
+            if hard_link_alias {
+                println!("            - {} [hard-link alias]", entry.path.display());
+            } else {
+                println!("            - {}", entry.path.display());
+            }
+        }
+        if group.entries.len() > top {
+            println!(
+                "            - ... {} more paths",
+                group.entries.len() - top
+            );
+        }
     }
 
     if !findings.is_empty() {
@@ -167,6 +239,22 @@ fn print_human(scan: &ScanResult, findings: &[Finding], top: usize, min_size: u6
         }
         if scan.warnings.len() > 20 {
             println!("- ... {} more warnings", scan.warnings.len() - 20);
+        }
+    }
+
+    if !duplicates.warnings.is_empty() {
+        println!();
+        println!("Duplicate detection warnings:");
+        for warning in duplicates.warnings.iter().take(20) {
+            println!(
+                "- {} ({:?}): {}",
+                warning.path.display(),
+                warning.kind,
+                warning.message
+            );
+        }
+        if duplicates.warnings.len() > 20 {
+            println!("- ... {} more warnings", duplicates.warnings.len() - 20);
         }
     }
 }

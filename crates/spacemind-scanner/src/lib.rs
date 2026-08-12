@@ -1,5 +1,5 @@
-use spacemind_core::{ItemKind, ScanResult, ScanWarning, ScannedItem};
-use std::collections::HashMap;
+use spacemind_core::{FileIdentity, ItemKind, ScanResult, ScanWarning, ScannedItem};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -53,10 +53,12 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let mut directory_sizes: HashMap<PathBuf, u64> = HashMap::new();
+    let mut directory_allocated_sizes: HashMap<PathBuf, u64> = HashMap::new();
+    let mut hard_link_allocations: HashMap<FileIdentity, (u64, Vec<PathBuf>)> = HashMap::new();
+    let mut allocated_sizes_available = true;
     let mut file_count = 0_u64;
     let mut directory_count = 0_u64;
 
-    // start walking trough the root
     for result in walker {
         let entry = match result {
             Ok(entry) => entry,
@@ -97,45 +99,103 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
         } else {
             0
         };
+        let identity = (kind == ItemKind::File)
+            .then(|| file_identity(&metadata))
+            .flatten();
+        let allocated_size_bytes = (kind == ItemKind::File)
+            .then(|| allocated_size(&metadata))
+            .flatten();
+        let links = (kind == ItemKind::File)
+            .then(|| hard_link_count(&metadata))
+            .flatten();
 
         match kind {
             ItemKind::File => {
                 file_count += 1;
                 add_size_to_ancestors(&root, &path, size_bytes, &mut directory_sizes);
+                match allocated_size_bytes {
+                    Some(allocated) => match (identity, links) {
+                        (Some(identity), Some(link_count)) if link_count > 1 => {
+                            let occurrence = hard_link_allocations
+                                .entry(identity)
+                                .or_insert_with(|| (allocated, Vec::new()));
+                            occurrence.1.push(path.clone());
+                        }
+                        _ => add_allocated_size_to_ancestors(
+                            &root,
+                            &path,
+                            allocated,
+                            &mut directory_allocated_sizes,
+                        ),
+                    },
+                    None => allocated_sizes_available = false,
+                }
             }
             ItemKind::Directory => {
                 directory_count += 1;
                 directory_sizes.entry(path.clone()).or_default();
+                directory_allocated_sizes.entry(path.clone()).or_default();
             }
             ItemKind::Symlink | ItemKind::Other => {}
         }
 
+        let modified = metadata.modified().ok();
         items.push(ScannedItem {
             extension: normalized_extension(&path, kind),
             path,
             kind,
             size_bytes,
+            allocated_size_bytes,
+            file_identity: identity,
+            hard_link_count: links,
             created_at_epoch_seconds: metadata.created().ok().and_then(epoch_seconds),
-            modified_at_epoch_seconds: metadata.modified().ok().and_then(epoch_seconds),
+            modified_at_epoch_seconds: modified.and_then(epoch_seconds),
+            modified_at_epoch_nanoseconds: modified.and_then(epoch_nanoseconds),
             accessed_at_epoch_seconds: metadata.accessed().ok().and_then(epoch_seconds),
         });
+    }
+
+    for (_, (allocated, paths)) in hard_link_allocations {
+        let mut seen_ancestors = HashSet::new();
+        for path in paths {
+            add_allocated_size_to_unique_ancestors(
+                &root,
+                &path,
+                allocated,
+                &mut directory_allocated_sizes,
+                &mut seen_ancestors,
+            );
+        }
     }
 
     for item in &mut items {
         if item.kind == ItemKind::Directory {
             item.size_bytes = directory_sizes.get(&item.path).copied().unwrap_or(0);
+            item.allocated_size_bytes = allocated_sizes_available.then(|| {
+                directory_allocated_sizes
+                    .get(&item.path)
+                    .copied()
+                    .unwrap_or(0)
+            });
         }
     }
 
     items.sort_by(|left, right| left.path.cmp(&right.path));
     warnings.sort_by(|left, right| left.path.cmp(&right.path));
     let total_size_bytes = directory_sizes.get(&root).copied().unwrap_or(0);
+    let total_allocated_size_bytes = allocated_sizes_available.then(|| {
+        directory_allocated_sizes
+            .get(&root)
+            .copied()
+            .unwrap_or(0)
+    });
 
     Ok(ScanResult {
         root,
         started_at_epoch_seconds,
         completed_at_epoch_seconds: now_epoch_seconds(),
         total_size_bytes,
+        total_allocated_size_bytes,
         file_count,
         directory_count,
         items,
@@ -165,6 +225,54 @@ fn add_size_to_ancestors(
     }
 }
 
+fn add_allocated_size_to_ancestors(
+    root: &Path,
+    path: &Path,
+    allocated_size_bytes: u64,
+    directory_sizes: &mut HashMap<PathBuf, u64>,
+) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+
+    for ancestor in parent.ancestors() {
+        if !ancestor.starts_with(root) {
+            break;
+        }
+        let total = directory_sizes.entry(ancestor.to_path_buf()).or_default();
+        *total = total.saturating_add(allocated_size_bytes);
+        if ancestor == root {
+            break;
+        }
+    }
+}
+
+fn add_allocated_size_to_unique_ancestors(
+    root: &Path,
+    path: &Path,
+    allocated_size_bytes: u64,
+    directory_sizes: &mut HashMap<PathBuf, u64>,
+    seen_ancestors: &mut HashSet<PathBuf>,
+) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+
+    for ancestor in parent.ancestors() {
+        if !ancestor.starts_with(root) {
+            break;
+        }
+        let ancestor = ancestor.to_path_buf();
+        if seen_ancestors.insert(ancestor.clone()) {
+            let total = directory_sizes.entry(ancestor.clone()).or_default();
+            *total = total.saturating_add(allocated_size_bytes);
+        }
+        if ancestor == root {
+            break;
+        }
+    }
+}
+
 fn normalized_extension(path: &Path, kind: ItemKind) -> Option<String> {
     if kind != ItemKind::File {
         return None;
@@ -175,11 +283,75 @@ fn normalized_extension(path: &Path, kind: ItemKind) -> Option<String> {
 }
 
 fn epoch_seconds(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH).ok().map(|value| value.as_secs())
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_secs())
+}
+
+fn epoch_nanoseconds(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|value| u64::try_from(value.as_nanos()).ok())
 }
 
 fn now_epoch_seconds() -> u64 {
     epoch_seconds(SystemTime::now()).unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(FileIdentity {
+        volume_id: metadata.dev(),
+        file_id: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    Some(FileIdentity {
+        volume_id: u64::from(metadata.volume_serial_number()?),
+        file_id: metadata.file_index()?,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
+#[cfg(unix)]
+fn allocated_size(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.blocks().saturating_mul(512))
+}
+
+#[cfg(not(unix))]
+fn allocated_size(_metadata: &fs::Metadata) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn hard_link_count(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.nlink())
+}
+
+#[cfg(windows)]
+fn hard_link_count(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.number_of_links().map(u64::from)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hard_link_count(_metadata: &fs::Metadata) -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -222,7 +394,11 @@ mod tests {
 
         assert_eq!(result.file_count, 2);
         assert_eq!(result.total_size_bytes, 8);
-        let nested_item = result.items.iter().find(|item| item.path == nested).unwrap();
+        let nested_item = result
+            .items
+            .iter()
+            .find(|item| item.path == nested)
+            .unwrap();
         assert_eq!(nested_item.size_bytes, 5);
     }
 
@@ -233,7 +409,11 @@ mod tests {
         fs::create_dir(&empty).unwrap();
 
         let result = scan(&ScanOptions::new(&test_dir.0)).unwrap();
-        let empty_item = result.items.iter().find(|item| item.path == empty).unwrap();
+        let empty_item = result
+            .items
+            .iter()
+            .find(|item| item.path == empty)
+            .unwrap();
 
         assert_eq!(empty_item.kind, ItemKind::Directory);
         assert_eq!(empty_item.size_bytes, 0);
@@ -253,6 +433,61 @@ mod tests {
 
         assert_eq!(result.file_count, 0);
         assert_eq!(result.total_size_bytes, 0);
-        assert!(result.items.iter().any(|item| item.kind == ItemKind::Symlink));
+        assert!(result
+            .items
+            .iter()
+            .any(|item| item.kind == ItemKind::Symlink));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn records_hard_links_without_double_counting_allocated_total() {
+        let test_dir = TestDirectory::new("hard-link");
+        let original = test_dir.0.join("original.bin");
+        let alias = test_dir.0.join("alias.bin");
+        fs::write(&original, vec![7_u8; 4096]).unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+
+        let result = scan(&ScanOptions::new(&test_dir.0)).unwrap();
+        let original_item = result
+            .items
+            .iter()
+            .find(|item| item.path == original)
+            .unwrap();
+        let alias_item = result
+            .items
+            .iter()
+            .find(|item| item.path == alias)
+            .unwrap();
+
+        assert_eq!(result.total_size_bytes, 8192);
+        assert_eq!(original_item.file_identity, alias_item.file_identity);
+        assert_eq!(original_item.hard_link_count, Some(2));
+        assert_eq!(
+            result.total_allocated_size_bytes,
+            original_item.allocated_size_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinguishes_logical_and_allocated_size() {
+        let test_dir = TestDirectory::new("allocated-size");
+        let sparse = test_dir.0.join("sparse.bin");
+        fs::File::create(&sparse)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+
+        let result = scan(&ScanOptions::new(&test_dir.0)).unwrap();
+        let item = result
+            .items
+            .iter()
+            .find(|item| item.path == sparse)
+            .unwrap();
+
+        assert_eq!(item.size_bytes, 1024 * 1024);
+        assert!(item.allocated_size_bytes.is_some());
+        assert!(item.allocated_size_bytes.unwrap() <= item.size_bytes);
     }
 }

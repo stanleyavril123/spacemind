@@ -1,6 +1,6 @@
 # Scanner CLI
 
-The first SpaceMind vertical slice is a read-only Rust scanner with deterministic recommendation rules. It does not delete, archive, rename, or modify files.
+The current SpaceMind vertical slice is a read-only Rust scanner with deterministic recommendation rules and exact duplicate detection. It does not delete, archive, rename, or modify files.
 
 ## Run a scan
 
@@ -24,7 +24,21 @@ For structured output:
 cargo run -p spacemind-cli -- scan ~/Downloads --format json
 ```
 
-JSON output includes the complete scan, warnings, metadata, and all deterministic findings. It is intended to become the boundary consumed by SQLite persistence and the desktop interface.
+JSON output includes the complete scan, warnings, metadata, deterministic findings, and duplicate report. It is intended to become the boundary consumed by SQLite persistence and the desktop interface.
+
+## Exact duplicate detection
+
+SpaceMind first groups nonempty files by logical size. Only size groups containing at least two separately allocated files are hashed. Matching BLAKE3 hashes form exact duplicate groups.
+
+The CLI hashes files of at least 1 MiB by default. Change that threshold when smaller duplicates matter:
+
+```bash
+cargo run -p spacemind-cli -- scan ~/Downloads --duplicate-min-size 1B
+```
+
+Hashing is streamed in bounded memory. SpaceMind verifies file identity, length, and modification time before and after hashing. Unreadable, replaced, deleted, or changing candidates produce warnings and are excluded from duplicate groups.
+
+Hard-linked names share a physical file identity. They appear as aliases in a matching group but are hashed once and never counted as separately recoverable space. Potential recovery retains one physical copy and uses allocated disk size when the operating system exposes it.
 
 ## Rules
 
@@ -52,15 +66,16 @@ Findings are evidence for review, not deletion decisions. A large item is assign
 - Traversal stays on the starting filesystem by default.
 - Use `--cross-filesystems` to explicitly include mounted filesystems beneath the root.
 - Permission failures and files that disappear during scanning become warnings instead of aborting the whole scan.
-- Sizes represent logical file length.
-- Hard-linked names are currently counted separately.
+- Logical size records the visible byte length of every file name.
+- Allocated size records disk blocks where the platform exposes them.
+- Hard-linked files have one physical identity and are counted once in allocated directory totals.
 
 ## Tests
 
 Run the workspace tests with:
 
 ```bash
-cargo test --workspace
+cargo test --workspace --locked
 ```
 
-The suite covers nested size aggregation, empty directories, symlink safety, size parsing, deterministic rules, JSON serialization, and the compiled CLI process.
+The suite covers nested size aggregation, logical and allocated sizes, hard links, empty directories, symlink safety, size parsing, deterministic rules, exact duplicates, changed and unreadable candidates, JSON serialization, and the compiled CLI process.
