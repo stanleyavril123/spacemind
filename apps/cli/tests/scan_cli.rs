@@ -53,8 +53,25 @@ fn scans_a_directory_and_emits_duplicate_json() {
         json["duplicates"]["groups"][0]["unique_file_count"],
         2
     );
-    assert!(json["duplicates"]["potential_recovery_bytes"]
+    assert!(json["duplicates"]["potential_recovery_allocated_bytes"]
         .as_u64()
         .unwrap()
         > 0);
+}
+
+#[test]
+fn zero_argument_launch_scans_the_current_directory_without_a_terminal() {
+    let directory = TestDirectory::new();
+    fs::write(directory.0.join("example.bin"), [7_u8; 16]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("SPACEMIND"));
+    assert!(report.contains("worth reviewing"));
+    assert!(report.contains("Nothing was deleted or modified"));
 }

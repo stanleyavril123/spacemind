@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod progress;
+pub use progress::{AnalysisPhase, CancellationToken, ProgressEvent};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FileIdentity {
     /// Identifies the filesystem or volume containing the file.
@@ -85,8 +88,11 @@ pub struct DuplicateGroup {
     pub entries: Vec<DuplicateEntry>,
     /// Number of separately allocated files after hard-linked names are collapsed.
     pub unique_file_count: u64,
-    /// Conservative estimate that retains one physical copy.
-    pub potential_recovery_bytes: u64,
+    /// Logical bytes represented by all but one separately allocated copy.
+    pub logical_duplicate_bytes: u64,
+    /// Conservative allocated-space estimate that retains one physical copy.
+    /// `None` means allocated size was unavailable for at least one physical copy.
+    pub potential_recovery_allocated_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +101,9 @@ pub struct DuplicateReport {
     pub warnings: Vec<DuplicateWarning>,
     pub files_hashed: u64,
     pub bytes_hashed: u64,
-    pub potential_recovery_bytes: u64,
+    pub logical_duplicate_bytes: u64,
+    /// Total conservative allocated-space estimate, when every group has one.
+    pub potential_recovery_allocated_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

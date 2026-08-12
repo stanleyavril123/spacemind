@@ -1,10 +1,18 @@
 use spacemind_core::{
-    Finding, FindingCategory, ItemKind, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
+    AnalysisPhase, CancellationToken, Finding, FindingCategory, ItemKind, ProgressEvent, RiskLevel,
+    ScanResult, ScannedItem, SuggestedAction,
 };
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
+const PROGRESS_INTERVAL_ITEMS: u64 = 128;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuleError {
+    #[error("recommendation building cancelled after processing {items_processed} items")]
+    Cancelled { items_processed: u64 },
+}
 
 #[derive(Debug, Clone)]
 pub struct RuleOptions {
@@ -27,10 +35,32 @@ impl Default for RuleOptions {
 }
 
 pub fn evaluate(scan: &ScanResult, options: &RuleOptions) -> Vec<Finding> {
+    let cancellation = CancellationToken::new();
+    evaluate_with_progress(scan, options, &cancellation, |_| {})
+        .expect("a fresh cancellation token cannot be cancelled")
+}
+
+pub fn evaluate_with_progress<F>(
+    scan: &ScanResult,
+    options: &RuleOptions,
+    cancellation: &CancellationToken,
+    mut on_progress: F,
+) -> Result<Vec<Finding>, RuleError>
+where
+    F: FnMut(&ProgressEvent),
+{
     let mut findings = Vec::new();
+    let total_items = scan.items.len() as u64;
+    let mut items_processed = 0_u64;
+    report_rule_progress(&mut on_progress, items_processed, total_items, false);
 
     for item in &scan.items {
+        if cancellation.is_cancelled() {
+            return Err(RuleError::Cancelled { items_processed });
+        }
+        items_processed = items_processed.saturating_add(1);
         if item.path == scan.root || matches!(item.kind, ItemKind::Symlink | ItemKind::Other) {
+            report_rule_progress(&mut on_progress, items_processed, total_items, false);
             continue;
         }
 
@@ -75,6 +105,7 @@ pub fn evaluate(scan: &ScanResult, options: &RuleOptions) -> Vec<Finding> {
                 ));
             }
         }
+        report_rule_progress(&mut on_progress, items_processed, total_items, false);
     }
 
     findings.sort_by(|left, right| {
@@ -84,7 +115,31 @@ pub fn evaluate(scan: &ScanResult, options: &RuleOptions) -> Vec<Finding> {
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| category_rank(left.category).cmp(&category_rank(right.category)))
     });
-    findings
+    if cancellation.is_cancelled() {
+        return Err(RuleError::Cancelled { items_processed });
+    }
+    report_rule_progress(&mut on_progress, items_processed, total_items, true);
+    Ok(findings)
+}
+
+fn report_rule_progress<F>(
+    on_progress: &mut F,
+    items_processed: u64,
+    total_items: u64,
+    complete: bool,
+) where
+    F: FnMut(&ProgressEvent),
+{
+    if complete || items_processed == 0 || items_processed % PROGRESS_INTERVAL_ITEMS == 0 {
+        on_progress(&ProgressEvent {
+            phase: AnalysisPhase::BuildingRecommendations,
+            items_processed,
+            bytes_processed: 0,
+            total_items: Some(total_items),
+            total_bytes: None,
+            current_path: None,
+        });
+    }
 }
 
 fn large_item_finding(item: &ScannedItem, threshold: u64) -> Finding {
@@ -279,5 +334,61 @@ mod tests {
         let findings = evaluate(&scan_with(item), &options);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::GeneratedDirectory);
+    }
+
+    #[test]
+    fn reports_recommendation_progress() {
+        let item = ScannedItem {
+            path: PathBuf::from("/test/archive.zip"),
+            kind: ItemKind::File,
+            size_bytes: 500,
+            allocated_size_bytes: None,
+            file_identity: None,
+            hard_link_count: None,
+            created_at_epoch_seconds: None,
+            modified_at_epoch_seconds: None,
+            modified_at_epoch_nanoseconds: None,
+            accessed_at_epoch_seconds: None,
+            extension: Some("zip".into()),
+        };
+        let scan = scan_with(item);
+        let cancellation = CancellationToken::new();
+        let mut events = Vec::new();
+
+        evaluate_with_progress(&scan, &RuleOptions::default(), &cancellation, |event| {
+            events.push(event.clone())
+        })
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].items_processed, 0);
+        assert_eq!(events[0].total_items, Some(1));
+        assert_eq!(events[1].items_processed, 1);
+        assert_eq!(events[1].phase, AnalysisPhase::BuildingRecommendations);
+    }
+
+    #[test]
+    fn cancellation_stops_recommendation_building() {
+        let item = ScannedItem {
+            path: PathBuf::from("/test/archive.zip"),
+            kind: ItemKind::File,
+            size_bytes: 500,
+            allocated_size_bytes: None,
+            file_identity: None,
+            hard_link_count: None,
+            created_at_epoch_seconds: None,
+            modified_at_epoch_seconds: None,
+            modified_at_epoch_nanoseconds: None,
+            accessed_at_epoch_seconds: None,
+            extension: Some("zip".into()),
+        };
+        let scan = scan_with(item);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            evaluate_with_progress(&scan, &RuleOptions::default(), &cancellation, |_| {}),
+            Err(RuleError::Cancelled { items_processed: 0 })
+        ));
     }
 }
