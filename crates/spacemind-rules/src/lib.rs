@@ -1,6 +1,6 @@
 use spacemind_core::{
-    AnalysisPhase, CancellationToken, Finding, FindingCategory, ItemKind, ProgressEvent, RiskLevel,
-    ScanResult, ScannedItem, SuggestedAction,
+    AnalysisPhase, CancellationToken, Finding, FindingCategory, ItemKind, PathMatcher, PathRule,
+    PathRuleError, ProgressEvent, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
 };
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +10,8 @@ const PROGRESS_INTERVAL_ITEMS: u64 = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuleError {
+    #[error("invalid protected-path rule: {0}")]
+    InvalidProtectedRule(#[from] PathRuleError),
     #[error("recommendation building cancelled after processing {items_processed} items")]
     Cancelled { items_processed: u64 },
 }
@@ -19,6 +21,7 @@ pub struct RuleOptions {
     pub large_item_threshold_bytes: u64,
     pub old_item_threshold_days: u64,
     pub now_epoch_seconds: u64,
+    pub protected_rules: Vec<PathRule>,
 }
 
 impl Default for RuleOptions {
@@ -30,6 +33,7 @@ impl Default for RuleOptions {
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
+            protected_rules: Vec::new(),
         }
     }
 }
@@ -37,19 +41,47 @@ impl Default for RuleOptions {
 pub fn evaluate(scan: &ScanResult, options: &RuleOptions) -> Vec<Finding> {
     let cancellation = CancellationToken::new();
     evaluate_with_progress(scan, options, &cancellation, |_| {})
-        .expect("a fresh cancellation token cannot be cancelled")
+        .expect("a fresh cancellation token and valid rules cannot fail")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleEvaluation {
+    pub findings: Vec<Finding>,
+    pub protected_items: u64,
+    pub suppressed_findings: u64,
 }
 
 pub fn evaluate_with_progress<F>(
     scan: &ScanResult,
     options: &RuleOptions,
     cancellation: &CancellationToken,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<Vec<Finding>, RuleError>
 where
     F: FnMut(&ProgressEvent),
 {
+    Ok(evaluate_with_policy_progress(
+        scan,
+        options,
+        cancellation,
+        on_progress,
+    )?
+    .findings)
+}
+
+pub fn evaluate_with_policy_progress<F>(
+    scan: &ScanResult,
+    options: &RuleOptions,
+    cancellation: &CancellationToken,
+    mut on_progress: F,
+) -> Result<RuleEvaluation, RuleError>
+where
+    F: FnMut(&ProgressEvent),
+{
+    let protected_matcher = PathMatcher::new(&scan.root, &options.protected_rules)?;
     let mut findings = Vec::new();
+    let mut protected_items = 0_u64;
+    let mut suppressed_findings = 0_u64;
     let total_items = scan.items.len() as u64;
     let mut items_processed = 0_u64;
     report_rule_progress(&mut on_progress, items_processed, total_items, false);
@@ -64,6 +96,8 @@ where
             continue;
         }
 
+        let protected = protected_matcher.is_match(&item.path);
+        let findings_before_item = findings.len();
         if item.size_bytes >= options.large_item_threshold_bytes {
             findings.push(large_item_finding(item, options.large_item_threshold_bytes));
         }
@@ -105,6 +139,13 @@ where
                 ));
             }
         }
+
+        if protected {
+            protected_items = protected_items.saturating_add(1);
+            suppressed_findings = suppressed_findings
+                .saturating_add((findings.len() - findings_before_item) as u64);
+            findings.truncate(findings_before_item);
+        }
         report_rule_progress(&mut on_progress, items_processed, total_items, false);
     }
 
@@ -119,7 +160,11 @@ where
         return Err(RuleError::Cancelled { items_processed });
     }
     report_rule_progress(&mut on_progress, items_processed, total_items, true);
-    Ok(findings)
+    Ok(RuleEvaluation {
+        findings,
+        protected_items,
+        suppressed_findings,
+    })
 }
 
 fn report_rule_progress<F>(
@@ -281,6 +326,7 @@ mod tests {
             file_count: u64::from(item.kind == ItemKind::File),
             directory_count: u64::from(item.kind == ItemKind::Directory),
             items: vec![item],
+            ignored_paths: Vec::new(),
             warnings: Vec::<ScanWarning>::new(),
         }
     }
@@ -304,6 +350,7 @@ mod tests {
             large_item_threshold_bytes: 1_000,
             old_item_threshold_days: 180,
             now_epoch_seconds: 300 * DAY_SECONDS,
+            ..RuleOptions::default()
         };
 
         let findings = evaluate(&scan_with(item), &options);
@@ -365,6 +412,38 @@ mod tests {
         assert_eq!(events[0].total_items, Some(1));
         assert_eq!(events[1].items_processed, 1);
         assert_eq!(events[1].phase, AnalysisPhase::BuildingRecommendations);
+    }
+
+    #[test]
+    fn protected_items_are_counted_but_never_recommended() {
+        let item = ScannedItem {
+            path: PathBuf::from("/test/Documents/archive.zip"),
+            kind: ItemKind::File,
+            size_bytes: 500,
+            allocated_size_bytes: None,
+            file_identity: None,
+            hard_link_count: None,
+            created_at_epoch_seconds: None,
+            modified_at_epoch_seconds: Some(100 * DAY_SECONDS),
+            modified_at_epoch_nanoseconds: None,
+            accessed_at_epoch_seconds: None,
+            extension: Some("zip".into()),
+        };
+        let scan = scan_with(item);
+        let options = RuleOptions {
+            large_item_threshold_bytes: 100,
+            old_item_threshold_days: 180,
+            now_epoch_seconds: 300 * DAY_SECONDS,
+            protected_rules: vec![PathRule::Exact(PathBuf::from("/test/Documents"))],
+        };
+        let cancellation = CancellationToken::new();
+
+        let evaluation =
+            evaluate_with_policy_progress(&scan, &options, &cancellation, |_| {}).unwrap();
+
+        assert!(evaluation.findings.is_empty());
+        assert_eq!(evaluation.protected_items, 1);
+        assert_eq!(evaluation.suppressed_findings, 2);
     }
 
     #[test]

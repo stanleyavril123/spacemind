@@ -1,8 +1,8 @@
 use blake3::Hasher;
 use spacemind_core::{
     AnalysisPhase, CancellationToken, DuplicateEntry, DuplicateGroup, DuplicateReport,
-    DuplicateWarning, DuplicateWarningKind, FileIdentity, ItemKind, ProgressEvent, ScanResult,
-    ScannedItem,
+    DuplicateWarning, DuplicateWarningKind, FileIdentity, ItemKind, PathMatcher, PathRule,
+    PathRuleError, ProgressEvent, ScanResult, ScannedItem,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
@@ -14,6 +14,8 @@ const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DuplicateError {
+    #[error("invalid protected-path rule: {0}")]
+    InvalidProtectedRule(#[from] PathRuleError),
     #[error(
         "duplicate detection cancelled after processing {items_processed} files and {bytes_processed} bytes"
     )]
@@ -37,12 +39,14 @@ impl From<DuplicateWarning> for HashFileError {
 #[derive(Debug, Clone)]
 pub struct DuplicateOptions {
     pub minimum_size_bytes: u64,
+    pub protected_rules: Vec<PathRule>,
 }
 
 impl Default for DuplicateOptions {
     fn default() -> Self {
         Self {
             minimum_size_bytes: 1,
+            protected_rules: Vec::new(),
         }
     }
 }
@@ -56,12 +60,13 @@ enum PhysicalKey {
 struct PhysicalCandidate<'a> {
     representative: &'a ScannedItem,
     entries: Vec<&'a ScannedItem>,
+    protected: bool,
 }
 
 pub fn detect_duplicates(scan: &ScanResult, options: &DuplicateOptions) -> DuplicateReport {
     let cancellation = CancellationToken::new();
     detect_duplicates_with_progress(scan, options, &cancellation, |_| {})
-        .expect("a fresh cancellation token cannot be cancelled")
+        .expect("a fresh cancellation token and valid rules cannot fail")
 }
 
 pub fn detect_duplicates_with_progress<F>(
@@ -131,6 +136,7 @@ where
     B: FnMut(&Path),
     A: FnMut(&Path),
 {
+    let protected_matcher = PathMatcher::new(&scan.root, &options.protected_rules)?;
     let mut candidates_by_size: BTreeMap<u64, Vec<&ScannedItem>> = BTreeMap::new();
     for item in &scan.items {
         if item.kind == ItemKind::File
@@ -148,7 +154,7 @@ where
     let mut total_items = 0_u64;
     let mut total_bytes = 0_u64;
     for (size_bytes, same_size_items) in candidates_by_size {
-        let physical_candidates = collapse_hard_links(same_size_items);
+        let physical_candidates = collapse_hard_links(same_size_items, &protected_matcher);
         if physical_candidates.len() < 2 {
             continue;
         }
@@ -348,6 +354,7 @@ fn revalidate_candidate<'a>(
     Some(PhysicalCandidate {
         representative,
         entries: valid_entries,
+        protected: candidate.protected,
     })
 }
 
@@ -367,9 +374,10 @@ fn validate_path_snapshot(item: &ScannedItem) -> Result<(), DuplicateWarning> {
     validate_scan_snapshot(item, &metadata)
 }
 
-fn collapse_hard_links(
-    items: Vec<&ScannedItem>,
-) -> BTreeMap<PhysicalKey, PhysicalCandidate<'_>> {
+fn collapse_hard_links<'a>(
+    items: Vec<&'a ScannedItem>,
+    protected_matcher: &PathMatcher,
+) -> BTreeMap<PhysicalKey, PhysicalCandidate<'a>> {
     let mut physical = BTreeMap::new();
     for item in items {
         let key = item
@@ -378,10 +386,14 @@ fn collapse_hard_links(
             .unwrap_or_else(|| PhysicalKey::Unknown(item.path.clone()));
         physical
             .entry(key)
-            .and_modify(|candidate: &mut PhysicalCandidate<'_>| candidate.entries.push(item))
+            .and_modify(|candidate: &mut PhysicalCandidate<'_>| {
+                candidate.protected |= protected_matcher.is_match(&item.path);
+                candidate.entries.push(item);
+            })
             .or_insert_with(|| PhysicalCandidate {
                 representative: item,
                 entries: vec![item],
+                protected: protected_matcher.is_match(&item.path),
             });
     }
     physical
@@ -393,9 +405,18 @@ fn build_group(
     candidates: Vec<PhysicalCandidate<'_>>,
 ) -> DuplicateGroup {
     let unique_file_count = candidates.len() as u64;
-    let physical_allocations: Option<Vec<u64>> = candidates
+    let protected_file_count = candidates
         .iter()
-        .map(|candidate| candidate.representative.allocated_size_bytes)
+        .filter(|candidate| candidate.protected)
+        .count() as u64;
+    let physical_allocations: Option<Vec<(u64, bool)>> = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .representative
+                .allocated_size_bytes
+                .map(|allocated| (allocated, candidate.protected))
+        })
         .collect();
     let mut entries = Vec::new();
 
@@ -405,17 +426,27 @@ fn build_group(
             file_identity: item.file_identity,
             allocated_size_bytes: item.allocated_size_bytes,
             hard_link_count: item.hard_link_count,
+            protected: candidate.protected,
         }));
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     let logical_duplicate_bytes = size_bytes.saturating_mul(unique_file_count.saturating_sub(1));
     let potential_recovery_allocated_bytes = physical_allocations.map(|allocations| {
-        let total_allocated = allocations
+        let unprotected_total = allocations
             .iter()
-            .fold(0_u64, |total, size| total.saturating_add(*size));
-        let retained_copy = allocations.into_iter().max().unwrap_or(0);
-        total_allocated.saturating_sub(retained_copy)
+            .filter(|(_, protected)| !protected)
+            .fold(0_u64, |total, (size, _)| total.saturating_add(*size));
+        if protected_file_count > 0 {
+            unprotected_total
+        } else {
+            let retained_copy = allocations
+                .iter()
+                .map(|(size, _)| *size)
+                .max()
+                .unwrap_or(0);
+            unprotected_total.saturating_sub(retained_copy)
+        }
     });
 
     DuplicateGroup {
@@ -423,6 +454,7 @@ fn build_group(
         size_bytes_per_file: size_bytes,
         entries,
         unique_file_count,
+        protected_file_count,
         logical_duplicate_bytes,
         potential_recovery_allocated_bytes,
     }
@@ -700,6 +732,29 @@ mod tests {
             report.potential_recovery_allocated_bytes,
             report.groups[0].potential_recovery_allocated_bytes
         );
+    }
+
+    #[test]
+    fn protected_copies_are_evidence_but_not_recoverable() {
+        let directory = TestDirectory::new("protected-copy");
+        let protected = directory.0.join("Documents");
+        fs::create_dir(&protected).unwrap();
+        let content = vec![3_u8; 8192];
+        fs::write(protected.join("kept.bin"), &content).unwrap();
+        fs::write(directory.0.join("copy-a.bin"), &content).unwrap();
+        fs::write(directory.0.join("copy-b.bin"), &content).unwrap();
+        let options = DuplicateOptions {
+            protected_rules: vec![PathRule::Exact(protected)],
+            ..DuplicateOptions::default()
+        };
+
+        let report = detect_duplicates(&directory.scan(), &options);
+        let group = &report.groups[0];
+        let one_allocation = group.entries[0].allocated_size_bytes.unwrap();
+
+        assert_eq!(group.protected_file_count, 1);
+        assert_eq!(group.potential_recovery_allocated_bytes, Some(one_allocation * 2));
+        assert_eq!(group.entries.iter().filter(|entry| entry.protected).count(), 1);
     }
 
     #[test]

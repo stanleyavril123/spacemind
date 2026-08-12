@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod path_policy;
 mod progress;
+pub use path_policy::{PathMatcher, PathRule, PathRuleError};
 pub use progress::{AnalysisPhase, CancellationToken, ProgressEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -54,6 +56,8 @@ pub struct ScanResult {
     pub file_count: u64,
     pub directory_count: u64,
     pub items: Vec<ScannedItem>,
+    /// Paths omitted from the scan because they matched an ignore rule.
+    pub ignored_paths: Vec<PathBuf>,
     pub warnings: Vec<ScanWarning>,
 }
 
@@ -79,6 +83,8 @@ pub struct DuplicateEntry {
     pub file_identity: Option<FileIdentity>,
     pub allocated_size_bytes: Option<u64>,
     pub hard_link_count: Option<u64>,
+    /// Protected entries are evidence only and are never counted as recoverable.
+    pub protected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +94,8 @@ pub struct DuplicateGroup {
     pub entries: Vec<DuplicateEntry>,
     /// Number of separately allocated files after hard-linked names are collapsed.
     pub unique_file_count: u64,
+    /// Number of separately allocated copies covered by a protection rule.
+    pub protected_file_count: u64,
     /// Logical bytes represented by all but one separately allocated copy.
     pub logical_duplicate_bytes: u64,
     /// Conservative allocated-space estimate that retains one physical copy.
