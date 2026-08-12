@@ -8,6 +8,10 @@ rust-version.workspace = true
 [dependencies]
 blake3.workspace = true
 spacemind-core.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 spacemind-scanner.workspace = true

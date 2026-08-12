@@ -10,3 +10,6 @@ spacemind-core.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+

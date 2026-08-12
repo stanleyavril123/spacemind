@@ -53,7 +53,7 @@ fn scans_a_directory_and_emits_duplicate_json() {
         json["duplicates"]["groups"][0]["unique_file_count"],
         2
     );
-    assert!(json["duplicates"]["potential_recovery_bytes"]
+    assert!(json["duplicates"]["potential_recovery_allocated_bytes"]
         .as_u64()
         .unwrap()
         > 0);

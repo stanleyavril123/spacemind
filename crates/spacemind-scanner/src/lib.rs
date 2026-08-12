@@ -1,4 +1,7 @@
-use spacemind_core::{FileIdentity, ItemKind, ScanResult, ScanWarning, ScannedItem};
+use spacemind_core::{
+    AnalysisPhase, CancellationToken, FileIdentity, ItemKind, ProgressEvent, ScanResult,
+    ScanWarning, ScannedItem,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -6,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use walkdir::WalkDir;
+
+const PROGRESS_INTERVAL_ITEMS: u64 = 128;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -28,9 +33,49 @@ pub enum ScanError {
     RootAccess { path: PathBuf, source: io::Error },
     #[error("scan root is not a directory: {0}")]
     RootNotDirectory(PathBuf),
+    #[error("scan cancelled after processing {items_processed} items and {bytes_processed} bytes")]
+    Cancelled {
+        items_processed: u64,
+        bytes_processed: u64,
+    },
 }
 
 pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
+    let cancellation = CancellationToken::new();
+    scan_with_progress(options, &cancellation, |_| {})
+}
+
+pub fn scan_with_progress<F>(
+    options: &ScanOptions,
+    cancellation: &CancellationToken,
+    mut on_progress: F,
+) -> Result<ScanResult, ScanError>
+where
+    F: FnMut(&ProgressEvent),
+{
+    scan_internal(
+        options,
+        cancellation,
+        &mut on_progress,
+        &mut |_| {},
+    )
+}
+
+fn scan_internal<F, H>(
+    options: &ScanOptions,
+    cancellation: &CancellationToken,
+    on_progress: &mut F,
+    before_metadata: &mut H,
+) -> Result<ScanResult, ScanError>
+where
+    F: FnMut(&ProgressEvent),
+    H: FnMut(&Path),
+{
+    let mut items_processed = 0_u64;
+    let mut bytes_processed = 0_u64;
+    on_progress(&ProgressEvent::starting(AnalysisPhase::Scanning));
+    check_cancelled(cancellation, items_processed, bytes_processed)?;
+
     let started_at_epoch_seconds = now_epoch_seconds();
     let root = fs::canonicalize(&options.root).map_err(|source| ScanError::RootAccess {
         path: options.root.clone(),
@@ -60,25 +105,44 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
     let mut directory_count = 0_u64;
 
     for result in walker {
+        check_cancelled(cancellation, items_processed, bytes_processed)?;
+        items_processed = items_processed.saturating_add(1);
+
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
+                let current_path = error.path().map(Path::to_path_buf);
                 warnings.push(ScanWarning {
-                    path: error.path().map(Path::to_path_buf),
+                    path: current_path.clone(),
                     message: error.to_string(),
                 });
+                report_scan_progress(
+                    on_progress,
+                    items_processed,
+                    bytes_processed,
+                    current_path,
+                    false,
+                );
                 continue;
             }
         };
 
         let path = entry.path().to_path_buf();
+        before_metadata(&path);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
                 warnings.push(ScanWarning {
-                    path: Some(path),
+                    path: Some(path.clone()),
                     message: error.to_string(),
                 });
+                report_scan_progress(
+                    on_progress,
+                    items_processed,
+                    bytes_processed,
+                    Some(path),
+                    false,
+                );
                 continue;
             }
         };
@@ -99,14 +163,15 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
         } else {
             0
         };
+        bytes_processed = bytes_processed.saturating_add(size_bytes);
         let identity = (kind == ItemKind::File)
-            .then(|| file_identity(&metadata))
+            .then(|| file_identity(&path, &metadata))
             .flatten();
         let allocated_size_bytes = (kind == ItemKind::File)
             .then(|| allocated_size(&metadata))
             .flatten();
         let links = (kind == ItemKind::File)
-            .then(|| hard_link_count(&metadata))
+            .then(|| hard_link_count(&path, &metadata))
             .flatten();
 
         match kind {
@@ -142,7 +207,7 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
         let modified = metadata.modified().ok();
         items.push(ScannedItem {
             extension: normalized_extension(&path, kind),
-            path,
+            path: path.clone(),
             kind,
             size_bytes,
             allocated_size_bytes,
@@ -153,11 +218,20 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
             modified_at_epoch_nanoseconds: modified.and_then(epoch_nanoseconds),
             accessed_at_epoch_seconds: metadata.accessed().ok().and_then(epoch_seconds),
         });
+        report_scan_progress(
+            on_progress,
+            items_processed,
+            bytes_processed,
+            Some(path),
+            false,
+        );
     }
 
+    check_cancelled(cancellation, items_processed, bytes_processed)?;
     for (_, (allocated, paths)) in hard_link_allocations {
         let mut seen_ancestors = HashSet::new();
         for path in paths {
+            check_cancelled(cancellation, items_processed, bytes_processed)?;
             add_allocated_size_to_unique_ancestors(
                 &root,
                 &path,
@@ -168,7 +242,10 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
         }
     }
 
-    for item in &mut items {
+    for (index, item) in items.iter_mut().enumerate() {
+        if index % 1024 == 0 {
+            check_cancelled(cancellation, items_processed, bytes_processed)?;
+        }
         if item.kind == ItemKind::Directory {
             item.size_bytes = directory_sizes.get(&item.path).copied().unwrap_or(0);
             item.allocated_size_bytes = allocated_sizes_available.then(|| {
@@ -190,6 +267,14 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
             .unwrap_or(0)
     });
 
+    report_scan_progress(
+        on_progress,
+        items_processed,
+        bytes_processed,
+        None,
+        true,
+    );
+
     Ok(ScanResult {
         root,
         started_at_epoch_seconds,
@@ -201,6 +286,42 @@ pub fn scan(options: &ScanOptions) -> Result<ScanResult, ScanError> {
         items,
         warnings,
     })
+}
+
+fn check_cancelled(
+    cancellation: &CancellationToken,
+    items_processed: u64,
+    bytes_processed: u64,
+) -> Result<(), ScanError> {
+    if cancellation.is_cancelled() {
+        Err(ScanError::Cancelled {
+            items_processed,
+            bytes_processed,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn report_scan_progress<F>(
+    on_progress: &mut F,
+    items_processed: u64,
+    bytes_processed: u64,
+    current_path: Option<PathBuf>,
+    complete: bool,
+) where
+    F: FnMut(&ProgressEvent),
+{
+    if complete || items_processed == 1 || items_processed % PROGRESS_INTERVAL_ITEMS == 0 {
+        on_progress(&ProgressEvent {
+            phase: AnalysisPhase::Scanning,
+            items_processed,
+            bytes_processed,
+            total_items: complete.then_some(items_processed),
+            total_bytes: complete.then_some(bytes_processed),
+            current_path,
+        });
+    }
 }
 
 fn add_size_to_ancestors(
@@ -299,7 +420,7 @@ fn now_epoch_seconds() -> u64 {
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+fn file_identity(_path: &Path, metadata: &fs::Metadata) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     Some(FileIdentity {
@@ -309,17 +430,16 @@ fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
 }
 
 #[cfg(windows)]
-fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-
-    Some(FileIdentity {
-        volume_id: u64::from(metadata.volume_serial_number()?),
-        file_id: metadata.file_index()?,
+fn file_identity(path: &Path, _metadata: &fs::Metadata) -> Option<FileIdentity> {
+    windows_file_information(path).map(|information| FileIdentity {
+        volume_id: u64::from(information.dwVolumeSerialNumber),
+        file_id: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
     })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+fn file_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<FileIdentity> {
     None
 }
 
@@ -336,22 +456,38 @@ fn allocated_size(_metadata: &fs::Metadata) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn hard_link_count(metadata: &fs::Metadata) -> Option<u64> {
+fn hard_link_count(_path: &Path, metadata: &fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
 
     Some(metadata.nlink())
 }
 
 #[cfg(windows)]
-fn hard_link_count(metadata: &fs::Metadata) -> Option<u64> {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.number_of_links().map(u64::from)
+fn hard_link_count(path: &Path, _metadata: &fs::Metadata) -> Option<u64> {
+    windows_file_information(path).map(|information| u64::from(information.nNumberOfLinks))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn hard_link_count(_metadata: &fs::Metadata) -> Option<u64> {
+fn hard_link_count(_path: &Path, _metadata: &fs::Metadata) -> Option<u64> {
     None
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    path: &Path,
+) -> Option<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let file = fs::File::open(path).ok()?;
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as isize, information.as_mut_ptr())
+    };
+    (succeeded != 0).then(|| unsafe { information.assume_init() })
 }
 
 #[cfg(test)]
@@ -400,6 +536,100 @@ mod tests {
             .find(|item| item.path == nested)
             .unwrap();
         assert_eq!(nested_item.size_bytes, 5);
+    }
+
+    #[test]
+    fn reports_progress_with_final_totals() {
+        let test_dir = TestDirectory::new("progress");
+        fs::write(test_dir.0.join("one.bin"), [0_u8; 3]).unwrap();
+        fs::write(test_dir.0.join("two.bin"), [0_u8; 5]).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut events = Vec::new();
+
+        let result = scan_with_progress(
+            &ScanOptions::new(&test_dir.0),
+            &cancellation,
+            |event| events.push(event.clone()),
+        )
+        .unwrap();
+
+        assert!(events.len() >= 2);
+        assert_eq!(events[0], ProgressEvent::starting(AnalysisPhase::Scanning));
+        let final_event = events.last().unwrap();
+        assert_eq!(final_event.total_items, Some(result.items.len() as u64));
+        assert_eq!(final_event.total_bytes, Some(result.total_size_bytes));
+    }
+
+    #[test]
+    fn cancellation_stops_scan_cooperatively() {
+        let test_dir = TestDirectory::new("cancel");
+        fs::write(test_dir.0.join("one.bin"), [0_u8; 3]).unwrap();
+        let cancellation = CancellationToken::new();
+        let cancellation_from_callback = cancellation.clone();
+
+        let result = scan_with_progress(
+            &ScanOptions::new(&test_dir.0),
+            &cancellation,
+            move |event| {
+                if event.items_processed >= 1 {
+                    cancellation_from_callback.cancel();
+                }
+            },
+        );
+
+        assert!(matches!(result, Err(ScanError::Cancelled { .. })));
+    }
+
+    #[test]
+    fn disappearing_file_becomes_a_warning() {
+        let test_dir = TestDirectory::new("disappearing");
+        let disappearing = test_dir.0.join("disappearing.bin");
+        fs::write(&disappearing, [0_u8; 3]).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut removed = false;
+
+        let result = scan_internal(
+            &ScanOptions::new(&test_dir.0),
+            &cancellation,
+            &mut |_| {},
+            &mut |path| {
+                if path == disappearing && !removed {
+                    fs::remove_file(path).unwrap();
+                    removed = true;
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.file_count, 0);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.path.as_ref() == Some(&disappearing)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_directory_becomes_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_dir = TestDirectory::new("permission-denied");
+        let locked = test_dir.0.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("hidden.bin"), [0_u8; 3]).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let result = scan(&ScanOptions::new(&test_dir.0)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.path.as_ref().is_some_and(|path| path.starts_with(&locked))));
     }
 
     #[test]

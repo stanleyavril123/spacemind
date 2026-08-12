@@ -175,9 +175,13 @@ fn print_human(
     println!();
     println!("Exact duplicate groups: {}", duplicates.groups.len());
     println!(
-        "Potential duplicate recovery: {}",
-        format_bytes(duplicates.potential_recovery_bytes)
+        "Logical duplicate bytes: {}",
+        format_bytes(duplicates.logical_duplicate_bytes)
     );
+    match duplicates.potential_recovery_allocated_bytes {
+        Some(bytes) => println!("Potential duplicate recovery: {}", format_bytes(bytes)),
+        None => println!("Potential duplicate recovery: unavailable on this platform"),
+    }
     println!(
         "Hashed: {} physical files ({})",
         duplicates.files_hashed,
@@ -185,12 +189,19 @@ fn print_human(
     );
     for group in duplicates.groups.iter().take(top) {
         println!();
-        println!(
-            "{:>10} recoverable  {} each  {} physical copies",
-            format_bytes(group.potential_recovery_bytes),
-            format_bytes(group.size_bytes_per_file),
-            group.unique_file_count
-        );
+        match group.potential_recovery_allocated_bytes {
+            Some(bytes) => println!(
+                "{:>10} recoverable  {} each  {} physical copies",
+                format_bytes(bytes),
+                format_bytes(group.size_bytes_per_file),
+                group.unique_file_count
+            ),
+            None => println!(
+                " unavailable recoverable  {} each  {} physical copies",
+                format_bytes(group.size_bytes_per_file),
+                group.unique_file_count
+            ),
+        }
         println!("            BLAKE3 {}", group.blake3_hash);
         let mut identities = HashSet::new();
         for entry in group.entries.iter().take(top) {
