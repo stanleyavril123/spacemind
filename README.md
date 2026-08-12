@@ -41,7 +41,7 @@ spacemind scan ~ --ignore "**/.git/**" --ignore "node_modules"
 ```
 
 During the scan, SpaceMind reports progress for filesystem scanning, duplicate hashing,
-and recommendation building. Press `Ctrl+C` to cancel safely. The analysis is read-only;
+relationship detection, and recommendation building. Press `Ctrl+C` to cancel safely. The analysis is read-only;
 no files are moved, deleted, or uploaded.
 
 For machine-readable output:

@@ -59,11 +59,20 @@ Hard-linked names share a physical file identity. They appear as aliases in a ma
 
 The initial rule engine identifies:
 
+- Node.js `node_modules` dependencies
+- Rust `target` directories beside a `Cargo.toml` manifest
+- Gradle caches and downloaded Gradle distributions
+- Android Virtual Device directories
+- VirtualBox, VMware, QEMU, and common virtual-disk formats
+- Old ISO images, application installers, and archives
+- User caches and known Linux or Windows operating-system caches
+- Generic `build` and `dist` directories
 - Items above the configurable large-item threshold
-- Old installer and disk-image formats
-- Old archive formats
-- `.cache` and Gradle cache directories
-- `node_modules`, `target`, `build`, and `dist` directories
+
+The classifier uses filesystem context where possible. For example, a directory named
+`target` receives the Rust classification only when a sibling `Cargo.toml` was found.
+VM bundles and Android emulators are high risk and suggested for archiving because they
+may contain unique user state. Generated dependencies and build caches receive lower risk.
 
 Change rule thresholds from the CLI:
 
@@ -73,7 +82,26 @@ cargo run -p spacemind-cli -- scan ~/Downloads \
   --old-days 240
 ```
 
-Findings are evidence for review, not deletion decisions. A large item is assigned high risk because size alone does not establish that it is replaceable.
+Findings are evidence for review, not deletion decisions. A large item is assigned high
+risk because size alone does not establish that it is replaceable.
+
+## Relationship detection
+
+After scanning and duplicate hashing, SpaceMind connects related items using deterministic
+filesystem evidence:
+
+- Archives with sibling directories that share the extracted name
+- Installers with sibling application directories sharing a normalized product name
+- `node_modules`, Rust `target`, `build`, and `dist` with source-project manifests
+- VM disks with VirtualBox, VMware, or OVF configuration
+- VM packages with matching imported VM directories in the scanned location
+- Android `.avd` directories with their matching `.ini` configuration
+- Exact duplicate files with the same size and BLAKE3 fingerprint
+
+Relationships have their own confidence and evidence in human and JSON output. Matching
+relationships are also added to recommendation explanations. They do not authorize deletion.
+An installer-to-directory match is deliberately described as related context; it does not prove
+that the application is installed.
 
 ## Filesystem behavior
 
