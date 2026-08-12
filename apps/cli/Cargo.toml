@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 ctrlc.workspace = true
+crossterm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 spacemind-core.workspace = true
@@ -19,4 +20,3 @@ spacemind-duplicates.workspace = true
 spacemind-rules.workspace = true
 spacemind-relationships.workspace = true
 spacemind-scanner.workspace = true
-

@@ -1,4 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::cursor;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{self, ClearType};
 use serde::Serialize;
 use spacemind_core::{
     AnalysisPhase, CancellationToken, DuplicateReport, Finding, FindingCategory, ItemKind,
@@ -15,7 +19,7 @@ use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -132,6 +136,7 @@ struct PolicySummary {
 #[derive(Clone, Copy)]
 struct Theme {
     colors: bool,
+    terminal: bool,
 }
 
 impl Theme {
@@ -145,14 +150,20 @@ impl Theme {
 
     #[cfg(test)]
     fn plain() -> Self {
-        Self { colors: false }
+        Self {
+            colors: false,
+            terminal: false,
+        }
     }
 
     fn for_terminal(is_terminal: bool) -> Self {
         let colors = is_terminal
             && env::var_os("NO_COLOR").is_none()
             && env::var("TERM").map(|term| term != "dumb").unwrap_or(true);
-        Self { colors }
+        Self {
+            colors,
+            terminal: is_terminal,
+        }
     }
 
     fn paint(self, text: impl AsRef<str>, code: &str) -> String {
@@ -164,40 +175,120 @@ impl Theme {
     }
 
     fn brand(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "1;38;2;255;111;97")
+        self.paint(text, "1;38;2;255;96;0")
     }
 
     fn accent(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "1;38;2;255;105;180")
+        self.paint(text, "38;2;255;96;0")
+    }
+
+    fn selected(self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;38;2;22;24;27;48;2;255;96;0")
     }
 
     fn aqua(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "1;38;2;94;234;212")
+        self.paint(text, "1;38;2;214;217;222")
     }
 
     fn green(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "1;38;2;106;219;153")
+        self.paint(text, "1;38;2;132;187;132")
     }
 
     fn yellow(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "1;38;2;246;193;119")
+        self.paint(text, "1;38;2;214;170;96")
     }
 
     fn red(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "1;38;2;255;107;107")
+        self.paint(text, "1;38;2;211;112;112")
     }
 
     fn text(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "1;38;2;245;245;250")
+        self.paint(text, "1;38;2;225;228;232")
     }
 
     fn muted(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "38;2;139;143;166")
+        self.paint(text, "38;2;132;137;145")
     }
 
     fn border(self, text: impl AsRef<str>) -> String {
-        self.paint(text, "38;2;91;84;138")
+        self.paint(text, "38;2;62;68;75")
     }
+}
+
+const MAX_CANVAS_WIDTH: usize = 86;
+const PLAIN_CANVAS_WIDTH: usize = 76;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalLayout {
+    columns: usize,
+    rows: usize,
+    width: usize,
+    margin: usize,
+}
+
+impl TerminalLayout {
+    fn detect(theme: Theme) -> Self {
+        if !theme.terminal {
+            return Self::for_size(PLAIN_CANVAS_WIDTH, 24);
+        }
+
+        let (columns, rows) = terminal::size()
+            .map(|(columns, rows)| (usize::from(columns), usize::from(rows)))
+            .or_else(|_| {
+                env::var("COLUMNS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .map(|columns| (columns, 24))
+                    .ok_or(())
+            })
+            .unwrap_or((PLAIN_CANVAS_WIDTH, 24));
+        Self::for_size(columns, rows)
+    }
+
+    fn for_size(columns: usize, rows: usize) -> Self {
+        let available = columns.saturating_sub(2);
+        let width = available.min(MAX_CANVAS_WIDTH).max(32).min(columns.max(1));
+        let margin = columns.saturating_sub(width) / 2;
+        Self {
+            columns,
+            rows,
+            width,
+            margin,
+        }
+    }
+
+    fn prefix(self) -> String {
+        " ".repeat(self.margin)
+    }
+
+    fn selector_top_padding(self, line_count: usize) -> usize {
+        self.rows.saturating_sub(line_count) / 3
+    }
+}
+
+fn terminal_layout(theme: Theme) -> TerminalLayout {
+    TerminalLayout::detect(theme)
+}
+
+fn terminal_width(theme: Theme) -> usize {
+    terminal_layout(theme).width
+}
+
+fn ui_margin(theme: Theme) -> String {
+    terminal_layout(theme).prefix()
+}
+
+fn write_ui_line<W: Write>(writer: &mut W, theme: Theme, line: impl AsRef<str>) -> io::Result<()> {
+    writeln!(writer, "{}{}", ui_margin(theme), line.as_ref())
+}
+
+macro_rules! ui_println {
+    ($theme:expr) => {
+        println!()
+    };
+    ($theme:expr, $($argument:tt)*) => {{
+        println!("{}{}", ui_margin($theme), format!($($argument)*))
+    }};
 }
 
 fn main() -> ExitCode {
@@ -210,7 +301,7 @@ fn main() -> ExitCode {
 
     match run(Cli::parse(), &cancellation) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) if cancellation.is_cancelled() => {
+        Err(error) if cancellation.is_cancelled() || is_interrupted(error.as_ref()) => {
             eprintln!("Scan cancelled safely. No files were changed.");
             ExitCode::from(130)
         }
@@ -219,6 +310,12 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn is_interrupted(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted)
 }
 
 fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>> {
@@ -343,20 +440,148 @@ fn resolve_scan_path(
     }
 
     let home = home_directory();
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
     let stdout = io::stdout();
     let mut writer = stdout.lock();
-    choose_directory(&mut reader, &mut writer, current, home, theme).map_err(Into::into)
+    choose_directory(&mut writer, current, home, theme).map_err(Into::into)
 }
 
-fn choose_directory<R: BufRead, W: Write>(
-    reader: &mut R,
+fn choose_directory<W: Write>(
     writer: &mut W,
     current: PathBuf,
     home: Option<PathBuf>,
     theme: Theme,
 ) -> io::Result<PathBuf> {
+    let choices = directory_choices(current, home);
+    let mut selected = 0_usize;
+    let mut custom_input: Option<String> = None;
+    let mut message: Option<String> = None;
+    let _raw_mode = RawModeGuard::enter(writer)?;
+
+    let result = loop {
+        render_directory_selector(
+            writer,
+            &choices,
+            selected,
+            custom_input.as_deref(),
+            message.as_deref(),
+            theme,
+        )?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        if matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        ) {
+            break Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "folder selection cancelled",
+            ));
+        }
+
+        if let Some(input) = custom_input.as_mut() {
+            match key.code {
+                KeyCode::Enter => {
+                    let path = expand_home(PathBuf::from(input.trim()));
+                    if path.is_dir() {
+                        break Ok(path);
+                    }
+                    message = Some("That folder does not exist. Check the path and try again.".to_owned());
+                }
+                KeyCode::Esc => {
+                    custom_input = None;
+                    message = None;
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    message = None;
+                }
+                KeyCode::Char(character) => {
+                    input.push(character);
+                    message = None;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('q'),
+                ..
+            } => {
+                break Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "folder selection cancelled",
+                ))
+            }
+            KeyEvent {
+                code: KeyCode::Up | KeyCode::Char('k'),
+                ..
+            } => {
+                selected = selected.checked_sub(1).unwrap_or(choices.len());
+                message = None;
+            }
+            KeyEvent {
+                code: KeyCode::Down | KeyCode::Char('j'),
+                ..
+            } => {
+                selected = (selected + 1) % (choices.len() + 1);
+                message = None;
+            }
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                ..
+            } => {
+                selected = choices.len();
+                custom_input = Some(String::new());
+                message = None;
+            }
+            KeyEvent {
+                code: KeyCode::Char(character),
+                ..
+            } if character.is_ascii_digit() => {
+                if let Some(index) = character
+                    .to_digit(10)
+                    .map(|value| value as usize)
+                    .and_then(|value| value.checked_sub(1))
+                    .filter(|index| *index <= choices.len())
+                {
+                    selected = index;
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                if let Some((_, path)) = choices.get(selected) {
+                    break Ok(path.clone());
+                }
+                custom_input = Some(String::new());
+                message = None;
+            }
+            _ => {}
+        }
+    };
+
+    execute!(
+        writer,
+        cursor::Show,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    result
+}
+
+fn directory_choices(current: PathBuf, home: Option<PathBuf>) -> Vec<(String, PathBuf)> {
     let mut choices = vec![("Current folder".to_owned(), current)];
     if let Some(home) = home {
         add_directory_choice(&mut choices, "Home", home.clone());
@@ -364,96 +589,113 @@ fn choose_directory<R: BufRead, W: Write>(
         add_directory_choice(&mut choices, "Documents", home.join("Documents"));
         add_directory_choice(&mut choices, "Desktop", home.join("Desktop"));
     }
+    choices
+}
 
-    writeln!(writer)?;
-    write_brand_header(writer, theme, "SCAN")?;
-    writeln!(
-        writer,
-        "\n  {}  Private storage analysis, entirely on your machine.",
-        theme.accent("discover your space.")
-    )?;
-    writeln!(writer, "\n  {}", theme.aqua("Choose a folder to scan"))?;
-    writeln!(writer, "  {}", theme.border("─".repeat(terminal_width() - 4)))?;
+fn render_directory_selector<W: Write>(
+    writer: &mut W,
+    choices: &[(String, PathBuf)],
+    selected: usize,
+    custom_input: Option<&str>,
+    message: Option<&str>,
+    theme: Theme,
+) -> io::Result<()> {
+    let layout = terminal_layout(theme);
+    let mut lines = brand_header_lines(theme, "SCAN").to_vec();
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}  {}",
+        theme.accent("storage, understood."),
+        theme.muted("Private analysis on this computer.")
+    ));
+    lines.push(String::new());
+    lines.push(format!("  {}", theme.text("Choose a folder to scan")));
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+
+    let path_width = layout.width.saturating_sub(29);
     for (index, (label, path)) in choices.iter().enumerate() {
-        let marker = if index == 0 {
-            theme.brand("›")
+        let choice = format!(" {:02}  {label:<16} ", index + 1);
+        let choice = if selected == index {
+            theme.selected(choice)
         } else {
-            " ".to_owned()
+            theme.text(choice)
         };
-        writeln!(
+        lines.push(format!(
+            "  {choice}  {}",
+            theme.muted(truncate_start(&path.display().to_string(), path_width))
+        ));
+    }
+
+    let custom_index = choices.len();
+    let custom_choice = format!(" {:02}  {:<16} ", custom_index + 1, "Custom path");
+    let custom_choice = if selected == custom_index {
+        theme.selected(custom_choice)
+    } else {
+        theme.text(custom_choice)
+    };
+    lines.push(format!("  {custom_choice}  {}", theme.muted("enter any folder")));
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+
+    if let Some(input) = custom_input {
+        lines.push(format!(
+            "  {} {}",
+            theme.accent("path ›"),
+            theme.text(format!("{input}▌"))
+        ));
+        lines.push(format!(
+            "  {} accept    {} go back",
+            theme.text("enter"),
+            theme.muted("esc")
+        ));
+    } else {
+        lines.push(format!(
+            "  {} move    {} scan    {} custom    {} quit",
+            theme.text("↑/↓  j/k"),
+            theme.text("enter"),
+            theme.accent("c"),
+            theme.muted("q")
+        ));
+    }
+    if let Some(message) = message {
+        lines.push(format!("  {} {}", theme.red("!"), theme.muted(message)));
+    }
+
+    execute!(writer, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+    let top = layout.selector_top_padding(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        execute!(
             writer,
-            "  {marker} {}  {}  {}",
-            theme.accent(format!("{:02}", index + 1)),
-            theme.text(format!("{label:<16}")),
-            theme.muted(path.display().to_string())
+            cursor::MoveTo(layout.margin as u16, (top + index) as u16),
+            crossterm::style::Print(line)
         )?;
     }
-    let custom_choice = choices.len() + 1;
-    writeln!(
-        writer,
-        "    {}  {}",
-        theme.accent(format!("{custom_choice:02}")),
-        theme.text("Enter another path")
-    )?;
-    writeln!(writer, "\n  {}", theme.border("─".repeat(terminal_width() - 4)))?;
-    writeln!(
-        writer,
-        "  {} select   {} current folder   {} cancel",
-        theme.accent("1–9"),
-        theme.aqua("enter"),
-        theme.muted("ctrl+c")
-    )?;
+    writer.flush()
+}
 
-    loop {
-        write!(writer, "\n  {} ", theme.brand("select ›"))?;
-        writer.flush()?;
-        let mut input = String::new();
-        if reader.read_line(&mut input)? == 0 {
-            return Ok(choices[0].1.clone());
-        }
-        let trimmed = input.trim();
-        let selected = if trimmed.is_empty() {
-            1
-        } else if let Ok(value) = trimmed.parse::<usize>() {
-            value
-        } else {
-            writeln!(
-                writer,
-                "  {} Please enter one of the numbers shown above.",
-                theme.red("!")
-            )?;
-            continue;
-        };
+struct RawModeGuard;
 
-        if let Some((_, path)) = choices.get(selected.saturating_sub(1)) {
-            return Ok(path.clone());
+impl RawModeGuard {
+    fn enter<W: Write>(writer: &mut W) -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        if let Err(error) = execute!(writer, cursor::Hide) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
         }
-        if selected != custom_choice {
-            writeln!(
-                writer,
-                "  {} Please choose a number from 1 to {custom_choice}.",
-                theme.red("!")
-            )?;
-            continue;
-        }
+        Ok(Self)
+    }
+}
 
-        loop {
-            write!(writer, "  {} ", theme.brand("path ›"))?;
-            writer.flush()?;
-            let mut custom = String::new();
-            if reader.read_line(&mut custom)? == 0 {
-                return Ok(choices[0].1.clone());
-            }
-            let path = expand_home(PathBuf::from(custom.trim()));
-            if path.is_dir() {
-                return Ok(path);
-            }
-            writeln!(
-                writer,
-                "  {} That folder does not exist. Try again.",
-                theme.red("!")
-            )?;
-        }
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), cursor::Show);
     }
 }
 
@@ -517,43 +759,43 @@ fn default_protected_rules() -> Vec<PathRule> {
     paths.into_iter().map(PathRule::Exact).collect()
 }
 
-fn terminal_width() -> usize {
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(76)
-        .clamp(56, 96)
+fn brand_header_lines(theme: Theme, active: &str) -> [String; 3] {
+    let width = terminal_width(theme);
+    let scan = if active == "SCAN" {
+        theme.selected(" scan ")
+    } else {
+        theme.muted(" scan ")
+    };
+    let report = if active == "REPORT" {
+        theme.selected(" report ")
+    } else {
+        theme.muted(" report ")
+    };
+    let right = "local / read only";
+    let fixed_width = " SPACEMIND    scan     report ".chars().count() + right.chars().count() + 1;
+    let padding = width.saturating_sub(fixed_width + 2);
+
+    [
+        theme.border(format!("┌{}┐", "─".repeat(width.saturating_sub(2)))),
+        format!(
+            "{} {}   {}   {}{}{} {}",
+            theme.border("│"),
+            theme.brand("SPACEMIND"),
+            scan,
+            report,
+            " ".repeat(padding),
+            theme.muted(right),
+            theme.border("│")
+        ),
+        theme.border(format!("└{}┘", "─".repeat(width.saturating_sub(2)))),
+    ]
 }
 
 fn write_brand_header<W: Write>(writer: &mut W, theme: Theme, active: &str) -> io::Result<()> {
-    let width = terminal_width();
-    let scan = if active == "SCAN" {
-        theme.accent("scan")
-    } else {
-        theme.muted("scan")
-    };
-    let report = if active == "REPORT" {
-        theme.accent("report")
-    } else {
-        theme.muted("report")
-    };
-    let left_width = "SPACEMIND   scan   report".chars().count();
-    let right = "LOCAL • READ ONLY";
-    let padding = width.saturating_sub(left_width + right.chars().count() + 4);
-
-    writeln!(writer, "{}", theme.border(format!("╭{}╮", "─".repeat(width - 2))))?;
-    writeln!(
-        writer,
-        "{} {}   {}   {}{}{} {}",
-        theme.border("│"),
-        theme.brand("SPACEMIND"),
-        scan,
-        report,
-        " ".repeat(padding),
-        theme.green(right),
-        theme.border("│")
-    )?;
-    writeln!(writer, "{}", theme.border(format!("╰{}╯", "─".repeat(width - 2))))
+    for line in brand_header_lines(theme, active) {
+        write_ui_line(writer, theme, line)?;
+    }
+    Ok(())
 }
 
 fn print_brand_header(theme: Theme, active: &str) {
@@ -564,21 +806,28 @@ fn print_brand_header(theme: Theme, active: &str) {
 
 fn print_scan_start(path: &Path, theme: Theme) {
     print_brand_header(theme, "SCAN");
-    println!(
-        "\n  {}  Understand what is taking space without changing anything.",
-        theme.accent("storage, understood.")
+    ui_println!(theme);
+    ui_println!(
+        theme,
+        "  {}  {}",
+        theme.accent("storage, understood."),
+        theme.muted("A private look at what is using your disk.")
     );
-    println!("\n  {}  {}", theme.muted("target"), theme.text(path.display().to_string()));
-    println!(
+    ui_println!(theme);
+    ui_println!(theme, "  {}  {}", theme.muted("target"), theme.text(path.display().to_string()));
+    ui_println!(
+        theme,
         "  {}  {}",
         theme.muted("safety"),
-        theme.green("read-only • local only • nothing is deleted")
+        theme.green("local / read only / nothing is deleted")
     );
-    println!(
-        "  {}  {}\n",
+    ui_println!(
+        theme,
+        "  {}  {}",
         theme.muted("cancel"),
         theme.text("ctrl+c at any time")
     );
+    ui_println!(theme);
 }
 
 struct CliProgress {
@@ -630,7 +879,7 @@ impl CliProgress {
             AnalysisPhase::DetectingRelationships => self.theme.aqua(&message),
             AnalysisPhase::Complete => self.theme.green(&message),
         };
-        eprint!("\r\x1b[2K  {rendered}");
+        eprint!("\r\x1b[2K{}  {rendered}", ui_margin(self.theme));
         let _ = io::stderr().flush();
         self.line_visible = true;
         self.last_phase = Some(event.phase);
@@ -715,6 +964,22 @@ fn compact_path(path: &Path) -> String {
         .to_string()
 }
 
+fn truncate_start(value: &str, maximum_width: usize) -> String {
+    let length = value.chars().count();
+    if length <= maximum_width {
+        return value.to_owned();
+    }
+    if maximum_width <= 1 {
+        return "…".chars().take(maximum_width).collect();
+    }
+
+    let visible_tail = value
+        .chars()
+        .skip(length - (maximum_width - 1))
+        .collect::<String>();
+    format!("…{visible_tail}")
+}
+
 fn print_human(
     scan: &ScanResult,
     findings: &[Finding],
@@ -725,86 +990,118 @@ fn print_human(
     min_size: u64,
     theme: Theme,
 ) {
-    println!();
+    ui_println!(theme);
     print_brand_header(theme, "REPORT");
 
-    print_section("SUMMARY", theme);
-    print_metric(theme, "location", scan.root.display().to_string());
+    let warning_count = scan.warnings.len() + duplicates.warnings.len();
+    print_report_index(theme);
+    print_section("01", "OVERVIEW", "What was scanned and what SpaceMind found", theme);
+    print_overview_counts(
+        theme,
+        findings.len(),
+        duplicates.groups.len(),
+        relationships.relationships.len(),
+    );
+    ui_println!(theme);
+    print_metric(
+        theme,
+        "location",
+        &scan.root.display().to_string(),
+        RecordTone::Text,
+    );
     print_metric(
         theme,
         "space analyzed",
-        format!("{} logical", format_bytes(scan.total_size_bytes)),
+        &format!("{} logical", format_bytes(scan.total_size_bytes)),
+        RecordTone::Text,
     );
     if let Some(size) = scan.total_allocated_size_bytes {
         print_metric(
             theme,
             "space on disk",
-            format!("{} allocated", format_bytes(size)),
+            &format!("{} allocated", format_bytes(size)),
+            RecordTone::Text,
         );
     }
     print_metric(
         theme,
         "contents",
-        format!(
+        &format!(
             "{} files • {} folders",
             format_count(scan.file_count),
             format_count(scan.directory_count)
         ),
+        RecordTone::Text,
     );
-    let warning_count = scan.warnings.len() + duplicates.warnings.len();
     if warning_count == 0 {
         print_metric(
             theme,
             "scan quality",
-            theme.green("complete • no unreadable items"),
+            "complete • no unreadable items",
+            RecordTone::Positive,
         );
     } else {
         print_metric(
             theme,
             "scan quality",
-            theme.yellow(format!("{warning_count} items skipped or changed")),
+            &format!("{warning_count} items skipped or changed"),
+            RecordTone::Warning,
         );
     }
 
-    print_section("SAFETY POLICY", theme);
+    print_section(
+        "02",
+        "SAFETY",
+        "Paths excluded from cleanup advice",
+        theme,
+    );
     print_metric(
         theme,
         "system defaults",
         if policy.default_protections_enabled {
-            theme.green("enabled")
+            "enabled"
         } else {
-            theme.yellow("disabled by user")
+            "disabled by user"
+        },
+        if policy.default_protections_enabled {
+            RecordTone::Positive
+        } else {
+            RecordTone::Warning
         },
     );
     print_metric(
         theme,
         "ignored",
-        format!(
+        &format!(
             "{} matched paths • {} configured rules • not scanned",
             policy.ignored_paths.len(),
             policy.ignored_rule_count
         ),
+        RecordTone::Text,
     );
     print_metric(
         theme,
         "protected",
-        format!(
+        &format!(
             "{} scanned items • {} active rules",
             format_count(policy.protected_items),
             policy.protected_rule_count
         ),
+        RecordTone::Text,
     );
     print_metric(
         theme,
         "advice withheld",
-        format!(
+        &format!(
             "{} recommendations • {} duplicate copies",
             format_count(policy.suppressed_recommendations),
             format_count(policy.protected_duplicate_copies)
         ),
+        RecordTone::Text,
     );
     for path in policy.ignored_paths.iter().take(5) {
-        println!(
+        ui_println!(
+            theme,
             "      {} {} {}",
             theme.muted("ignored"),
             theme.accent("•"),
@@ -812,99 +1109,141 @@ fn print_human(
         );
     }
     if policy.ignored_paths.len() > 5 {
-        println!(
+        ui_println!(
+            theme,
             "      {}",
             theme.muted(format!("… {} more ignored paths", policy.ignored_paths.len() - 5))
         );
     }
 
-    print_section("WORTH REVIEWING", theme);
+    print_section(
+        "03",
+        "RECOMMENDATIONS",
+        "Items that may be worth reviewing",
+        theme,
+    );
     if findings.is_empty() {
-        println!(
+        ui_println!(
+            theme,
             "  {} {}",
             theme.green("✓"),
             theme.text("No deterministic cleanup candidates were found.")
         );
     } else {
-        println!(
+        ui_println!(
+            theme,
             "  {} {}",
             theme.accent(format!("{} candidates", findings.len())),
             theme.muted("• suggestions only, never automatic deletions")
         );
-        println!();
         for (index, finding) in findings.iter().take(top).enumerate() {
-            println!(
-                "  {}. {}  •  {}",
-                theme.brand(format!("{:02}", index + 1)),
+            if index > 0 {
+                print_record_divider(theme);
+            }
+            ui_println!(
+                theme,
+                "  {}  {}",
+                theme.selected(format!(" {:02} ", index + 1)),
                 theme.text(category_label(finding.category)),
-                theme.yellow(format_bytes(finding.potential_recovery_bytes))
             );
-            println!(
-                "      {}",
-                theme.aqua(display_relative(&scan.root, &finding.path))
+            print_record_field(
+                theme,
+                "item",
+                &display_relative(&scan.root, &finding.path),
+                RecordTone::Text,
             );
-            println!(
-                "      {} {}  {} {}  {}",
-                theme.muted("risk"),
-                styled_risk(theme, finding.risk),
-                theme.muted("confidence"),
-                theme.aqua(format!("{:.0}%", finding.confidence * 100.0)),
-                theme.text(action_label(finding.suggested_action))
+            print_record_field(
+                theme,
+                "recovery",
+                &format_bytes(finding.potential_recovery_bytes),
+                RecordTone::Accent,
+            );
+            print_record_field(theme, "risk", risk_label(finding.risk), risk_tone(finding.risk));
+            print_record_field(
+                theme,
+                "confidence",
+                &format!("{:.0}%", finding.confidence * 100.0),
+                RecordTone::Text,
+            );
+            print_record_field(
+                theme,
+                "action",
+                action_label(finding.suggested_action),
+                RecordTone::Text,
             );
             if !finding.evidence.is_empty() {
-                println!(
-                    "      {} {}",
-                    theme.muted("why"),
-                    theme.muted(
-                        finding
-                            .evidence
-                            .iter()
-                            .map(|evidence| humanize_evidence(evidence))
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    )
-                );
+                ui_println!(theme, "      {}", theme.muted("evidence"));
+                for evidence in &finding.evidence {
+                    print_wrapped_bullet(
+                        theme,
+                        &humanize_evidence(evidence),
+                    );
+                }
             }
-            println!();
+        }
+        if findings.len() > top {
+            ui_println!(theme);
         }
         print_more(findings.len(), top, "recommendations", theme);
     }
 
-    print_section("RELATED ITEMS", theme);
+    print_section(
+        "04",
+        "RELATIONSHIPS",
+        "Filesystem context connecting related items",
+        theme,
+    );
     if relationships.relationships.is_empty() {
-        println!(
+        ui_println!(
+            theme,
             "  {} {}",
             theme.green("✓"),
             theme.text("No deterministic item relationships were found.")
         );
     } else {
-        println!(
+        ui_println!(
+            theme,
             "  {} {}",
             theme.accent(format!("{} connections", relationships.relationships.len())),
             theme.muted("• evidence only, never deletion authorization")
         );
-        println!();
         for (index, relationship) in relationships.relationships.iter().take(top).enumerate() {
-            println!(
-                "  {}. {}  •  {} confidence",
-                theme.brand(format!("{:02}", index + 1)),
+            if index > 0 {
+                print_record_divider(theme);
+            }
+            ui_println!(
+                theme,
+                "  {}  {}",
+                theme.selected(format!(" {:02} ", index + 1)),
                 theme.text(relationship_kind_label(relationship.kind)),
-                theme.aqua(format!("{:.0}%", relationship.confidence * 100.0))
             );
-            println!(
-                "      {} {} {}",
-                theme.aqua(display_relative(&scan.root, &relationship.source_path)),
-                theme.accent("↔"),
-                theme.aqua(display_relative(&scan.root, &relationship.target_path))
+            print_record_field(
+                theme,
+                "source",
+                &display_relative(&scan.root, &relationship.source_path),
+                RecordTone::Text,
+            );
+            print_record_field(
+                theme,
+                "related",
+                &display_relative(&scan.root, &relationship.target_path),
+                RecordTone::Text,
+            );
+            print_record_field(
+                theme,
+                "confidence",
+                &format!("{:.0}%", relationship.confidence * 100.0),
+                RecordTone::Text,
             );
             if !relationship.evidence.is_empty() {
-                println!(
-                    "      {} {}",
-                    theme.muted("why"),
-                    theme.muted(relationship.evidence.join("; "))
-                );
+                ui_println!(theme, "      {}", theme.muted("evidence"));
+                for evidence in &relationship.evidence {
+                    print_wrapped_bullet(theme, evidence);
+                }
             }
-            println!();
+        }
+        if relationships.relationships.len() > top {
+            ui_println!(theme);
         }
         print_more(
             relationships.relationships.len(),
@@ -914,15 +1253,22 @@ fn print_human(
         );
     }
 
-    print_section("EXACT DUPLICATES", theme);
+    print_section(
+        "05",
+        "DUPLICATES",
+        "Exact content matches verified with BLAKE3",
+        theme,
+    );
     if duplicates.groups.is_empty() {
-        println!(
+        ui_println!(
+            theme,
             "  {} {}",
             theme.green("✓"),
             theme.text("No exact duplicate groups found among the files checked.")
         );
     } else {
-        println!(
+        ui_println!(
+            theme,
             "  {} {}",
             theme.accent(format!("{} groups", duplicates.groups.len())),
             theme.muted(format!(
@@ -933,31 +1279,59 @@ fn print_human(
         print_metric(
             theme,
             "duplicate data",
-            theme.yellow(format_bytes(duplicates.logical_duplicate_bytes)),
+            &format_bytes(duplicates.logical_duplicate_bytes),
+            RecordTone::Warning,
         );
         match duplicates.potential_recovery_allocated_bytes {
             Some(bytes) => print_metric(
                 theme,
                 "safe recovery",
-                theme.green(format_bytes(bytes)),
+                &format_bytes(bytes),
+                RecordTone::Positive,
             ),
-            None => print_metric(theme, "safe recovery", theme.muted("unavailable")),
+            None => print_metric(theme, "safe recovery", "unavailable", RecordTone::Text),
         }
 
         for (index, group) in duplicates.groups.iter().take(top).enumerate() {
-            println!();
+            if index > 0 {
+                print_record_divider(theme);
+            }
             let recovery = group
                 .potential_recovery_allocated_bytes
                 .map(format_bytes)
                 .unwrap_or_else(|| "unknown".to_owned());
-            println!(
-                "  Group {}  •  {} each  •  {} physical copies  •  {} recoverable",
-                theme.brand(format!("{:02}", index + 1)),
-                theme.yellow(format_bytes(group.size_bytes_per_file)),
-                group.unique_file_count,
-                theme.green(recovery)
+            ui_println!(
+                theme,
+                "  {}  {}",
+                theme.selected(format!(" {:02} ", index + 1)),
+                theme.text("Exact duplicate group")
+            );
+            print_record_field(
+                theme,
+                "each file",
+                &format_bytes(group.size_bytes_per_file),
+                RecordTone::Text,
+            );
+            print_record_field(
+                theme,
+                "copies",
+                &format!("{} physical files", group.unique_file_count),
+                RecordTone::Text,
+            );
+            print_record_field(
+                theme,
+                "recovery",
+                &recovery,
+                RecordTone::Positive,
+            );
+            print_record_field(
+                theme,
+                "fingerprint",
+                &format!("{}…", &group.blake3_hash[..12.min(group.blake3_hash.len())]),
+                RecordTone::Text,
             );
             let mut identities = HashSet::new();
+            ui_println!(theme, "      {}", theme.muted("files"));
             for entry in &group.entries {
                 let hard_link_alias = entry
                     .file_identity
@@ -969,18 +1343,14 @@ fn print_human(
                     (false, true) => "  [same physical file]",
                     (false, false) => "",
                 };
-                println!(
-                    "      {} {}{}",
-                    theme.accent("•"),
-                    theme.aqua(display_relative(&scan.root, &entry.path)),
-                    theme.muted(suffix)
+                print_wrapped_bullet(
+                    theme,
+                    &format!("{}{}", display_relative(&scan.root, &entry.path), suffix),
                 );
             }
-            println!(
-                "      {} {}…",
-                theme.muted("fingerprint"),
-                theme.muted(&group.blake3_hash[..12.min(group.blake3_hash.len())])
-            );
+        }
+        if duplicates.groups.len() > top {
+            ui_println!(theme);
         }
         print_more(duplicates.groups.len(), top, "duplicate groups", theme);
     }
@@ -1001,46 +1371,82 @@ fn print_human(
             .then_with(|| left.path.cmp(&right.path))
     });
 
-    print_section("LARGEST ITEMS", theme);
+    print_section(
+        "06",
+        "LARGEST ITEMS",
+        "Files and folders ordered by logical size",
+        theme,
+    );
     if items.is_empty() {
-        println!("  No items matched the configured minimum size.");
+        ui_println!(theme, "  No items matched the configured minimum size.");
     } else {
+        ui_println!(
+            theme,
+            "  {}  {}  {}  {}",
+            theme.muted(format!("{:<4}", "#")),
+            theme.muted(format!("{:>10}", "SIZE")),
+            theme.muted(format!("{:<8}", "TYPE")),
+            theme.muted("PATH")
+        );
+        ui_println!(
+            theme,
+            "  {}",
+            theme.border("─".repeat(terminal_width(theme).saturating_sub(4)))
+        );
         for (index, item) in items.iter().take(top).enumerate() {
             let kind = match item.kind {
                 ItemKind::Directory => "folder",
                 ItemKind::File => "file",
                 ItemKind::Symlink | ItemKind::Other => "item",
             };
-            println!(
-                "  {}. {}  {}  {}",
+            ui_println!(
+                theme,
+                "  {}  {}  {}  {}",
                 theme.brand(format!("{:>2}", index + 1)),
                 theme.yellow(format!("{:>10}", format_bytes(item.size_bytes))),
-                theme.muted(format!("{kind:<6}")),
-                theme.text(display_relative(&scan.root, &item.path))
+                theme.muted(format!("{kind:<8}")),
+                theme.text(truncate_start(
+                    &display_relative(&scan.root, &item.path),
+                    terminal_width(theme).saturating_sub(33)
+                ))
             );
         }
         print_more(items.len(), top, "items", theme);
     }
 
     if warning_count > 0 {
-        print_section("SKIPPED SAFELY", theme);
-        println!(
-            "  {}",
-            theme.muted("These items were skipped; the rest of the scan is still usable.\n")
+        print_section(
+            "07",
+            "WARNINGS",
+            "Items skipped without stopping the scan",
+            theme,
         );
+        ui_println!(
+            theme,
+            "  {}",
+            theme.muted("These items were skipped; the rest of the scan is still usable.")
+        );
+        ui_println!(theme);
         for warning in scan.warnings.iter().take(10) {
             match &warning.path {
-                Some(path) => println!(
+                Some(path) => ui_println!(
+                    theme,
                     "  {} {} — {}",
                     theme.red("!"),
                     theme.text(display_relative(&scan.root, path)),
                     theme.muted(&warning.message)
                 ),
-                None => println!("  {} {}", theme.red("!"), theme.muted(&warning.message)),
+                None => ui_println!(
+                    theme,
+                    "  {} {}",
+                    theme.red("!"),
+                    theme.muted(&warning.message)
+                ),
             }
         }
         for warning in duplicates.warnings.iter().take(10) {
-            println!(
+            ui_println!(
+                theme,
                 "  {} {} — {}",
                 theme.red("!"),
                 theme.text(display_relative(&scan.root, &warning.path)),
@@ -1048,38 +1454,221 @@ fn print_human(
             );
         }
         if warning_count > 20 {
-            println!("  • … and {} more warnings", warning_count - 20);
+            ui_println!(theme, "  • … and {} more warnings", warning_count - 20);
         }
     }
 
-    println!(
-        "\n  {} {}\n",
+    ui_println!(theme);
+    ui_println!(
+        theme,
+        "  {}",
+        theme.border("─".repeat(terminal_width(theme).saturating_sub(4)))
+    );
+    ui_println!(
+        theme,
+        "  {} {}",
         theme.green("✓"),
         theme.green("Nothing was deleted or modified.")
     );
+    ui_println!(theme);
 }
 
-fn print_section(title: &str, theme: Theme) {
-    let remaining = terminal_width().saturating_sub(title.chars().count() + 8);
-    println!(
-        "\n  {} {} {}",
-        theme.border("╭─"),
-        theme.accent(title.to_ascii_lowercase()),
-        theme.border(format!("{}╮", "─".repeat(remaining)))
+fn print_report_index(theme: Theme) {
+    ui_println!(theme);
+    if terminal_width(theme) >= 74 {
+        ui_println!(
+            theme,
+            "  {}  {}  {}  {}  {}  {}",
+            theme.accent("01 overview"),
+            theme.muted("02 safety"),
+            theme.muted("03 review"),
+            theme.muted("04 related"),
+            theme.muted("05 duplicates"),
+            theme.muted("06 largest")
+        );
+    } else {
+        ui_println!(
+            theme,
+            "  {}  {}  {}",
+            theme.accent("01 overview"),
+            theme.muted("02 safety"),
+            theme.muted("03 review")
+        );
+        ui_println!(
+            theme,
+            "  {}  {}  {}",
+            theme.muted("04 related"),
+            theme.muted("05 duplicates"),
+            theme.muted("06 largest")
+        );
+    }
+}
+
+fn print_overview_counts(
+    theme: Theme,
+    recommendations: usize,
+    duplicate_groups: usize,
+    relationships: usize,
+) {
+    let review = format_count(recommendations as u64);
+    let duplicates = format_count(duplicate_groups as u64);
+    let connections = format_count(relationships as u64);
+    if terminal_width(theme) >= 62 {
+        ui_println!(
+            theme,
+            "  {}  {}    {}  {}    {}  {}",
+            theme.muted("review"),
+            theme.accent(review),
+            theme.muted("duplicates"),
+            theme.accent(duplicates),
+            theme.muted("connections"),
+            theme.accent(connections)
+        );
+    } else {
+        ui_println!(
+            theme,
+            "  {}  {}    {}  {}",
+            theme.muted("review"),
+            theme.accent(review),
+            theme.muted("duplicates"),
+            theme.accent(duplicates)
+        );
+        ui_println!(
+            theme,
+            "  {}  {}",
+            theme.muted("connections"),
+            theme.accent(connections)
+        );
+    }
+}
+
+fn print_section(number: &str, title: &str, description: &str, theme: Theme) {
+    let heading = format!("{number}  {title}");
+    let remaining = terminal_width(theme).saturating_sub(heading.chars().count() + 5);
+    ui_println!(theme);
+    ui_println!(
+        theme,
+        "  {} {}",
+        theme.accent(heading),
+        theme.border("─".repeat(remaining))
+    );
+    for line in wrap_text(description, terminal_width(theme).saturating_sub(8)) {
+        ui_println!(theme, "      {}", theme.muted(line));
+    }
+    ui_println!(theme);
+}
+
+fn print_record_divider(theme: Theme) {
+    ui_println!(
+        theme,
+        "      {}",
+        theme.border("·".repeat(terminal_width(theme).saturating_sub(8)))
     );
 }
 
-fn print_metric(theme: Theme, label: &str, value: impl AsRef<str>) {
-    println!(
-        "  {}  {}",
-        theme.muted(format!("{label:<17}")),
-        theme.text(value)
-    );
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordTone {
+    Text,
+    Accent,
+    Positive,
+    Warning,
+    Danger,
+}
+
+fn print_record_field(theme: Theme, label: &str, value: &str, tone: RecordTone) {
+    let value_width = terminal_width(theme).saturating_sub(24).max(12);
+    let lines = wrap_text(value, value_width);
+    for (index, line) in lines.iter().enumerate() {
+        let label = if index == 0 { label } else { "" };
+        let value = match tone {
+            RecordTone::Text => theme.text(line),
+            RecordTone::Accent => theme.accent(line),
+            RecordTone::Positive => theme.green(line),
+            RecordTone::Warning => theme.yellow(line),
+            RecordTone::Danger => theme.red(line),
+        };
+        ui_println!(
+            theme,
+            "      {}  {}",
+            theme.muted(format!("{label:<12}")),
+            value
+        );
+    }
+}
+
+fn print_wrapped_bullet(theme: Theme, value: &str) {
+    let value_width = terminal_width(theme).saturating_sub(14).max(12);
+    for (index, line) in wrap_text(value, value_width).iter().enumerate() {
+        let marker = if index == 0 { "•" } else { " " };
+        ui_println!(
+            theme,
+            "        {} {}",
+            theme.accent(marker),
+            theme.muted(line)
+        );
+    }
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    if value.is_empty() {
+        return vec![String::new()];
+    }
+
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let word_length = word.chars().count();
+        if word_length > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let characters = word.chars().collect::<Vec<_>>();
+            for chunk in characters.chunks(width) {
+                lines.push(chunk.iter().collect());
+            }
+            continue;
+        }
+
+        let separator = usize::from(!current.is_empty());
+        if current.chars().count() + separator + word_length > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn print_metric(theme: Theme, label: &str, value: &str, tone: RecordTone) {
+    let value_width = terminal_width(theme).saturating_sub(25).max(12);
+    for (index, line) in wrap_text(value, value_width).iter().enumerate() {
+        let label = if index == 0 { label } else { "" };
+        let value = match tone {
+            RecordTone::Text => theme.text(line),
+            RecordTone::Accent => theme.accent(line),
+            RecordTone::Positive => theme.green(line),
+            RecordTone::Warning => theme.yellow(line),
+            RecordTone::Danger => theme.red(line),
+        };
+        ui_println!(
+            theme,
+            "  {}  {}",
+            theme.muted(format!("{label:<17}")),
+            value
+        );
+    }
 }
 
 fn print_more(total: usize, shown: usize, label: &str, theme: Theme) {
     if total > shown {
-        println!(
+        ui_println!(
+            theme,
             "  {}",
             theme.muted(format!("… {} more {label} hidden by --top", total - shown))
         );
@@ -1131,11 +1720,11 @@ fn risk_label(risk: RiskLevel) -> &'static str {
     }
 }
 
-fn styled_risk(theme: Theme, risk: RiskLevel) -> String {
+fn risk_tone(risk: RiskLevel) -> RecordTone {
     match risk {
-        RiskLevel::Low => theme.green(risk_label(risk)),
-        RiskLevel::Medium => theme.yellow(risk_label(risk)),
-        RiskLevel::High => theme.red(risk_label(risk)),
+        RiskLevel::Low => RecordTone::Positive,
+        RiskLevel::Medium => RecordTone::Warning,
+        RiskLevel::High => RecordTone::Danger,
     }
 }
 
@@ -1226,7 +1815,6 @@ fn parse_size(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn parses_decimal_and_binary_sizes() {
@@ -1267,28 +1855,69 @@ mod tests {
     fn colors_are_optional_and_reset_after_styled_text() {
         assert_eq!(Theme::plain().accent("SpaceMind"), "SpaceMind");
 
-        let colored = Theme { colors: true }.brand("SpaceMind");
+        let colored = Theme {
+            colors: true,
+            terminal: true,
+        }
+        .brand("SpaceMind");
         assert!(colored.starts_with("\x1b["));
         assert!(colored.ends_with("\x1b[0m"));
     }
 
     #[test]
-    fn selector_defaults_to_the_current_directory() {
+    fn centers_the_canvas_in_wide_terminals() {
+        let layout = TerminalLayout::for_size(120, 36);
+
+        assert_eq!(layout.width, MAX_CANVAS_WIDTH);
+        assert_eq!(layout.margin, 17);
+        assert_eq!(layout.prefix(), " ".repeat(17));
+    }
+
+    #[test]
+    fn keeps_the_canvas_inside_narrow_terminals() {
+        let layout = TerminalLayout::for_size(50, 24);
+
+        assert_eq!(layout.width, 48);
+        assert_eq!(layout.margin, 1);
+    }
+
+    #[test]
+    fn selector_lists_the_current_directory_first() {
         let current = env::temp_dir();
-        let mut input = Cursor::new("\n");
+        let choices = directory_choices(current.clone(), None);
+
+        assert_eq!(choices, vec![("Current folder".to_owned(), current)]);
+    }
+
+    #[test]
+    fn selector_renders_navigation_help_and_custom_path() {
+        let choices = vec![("Current folder".to_owned(), PathBuf::from("/example"))];
         let mut output = Vec::new();
 
-        let selected = choose_directory(
-            &mut input,
-            &mut output,
-            current.clone(),
-            None,
-            Theme::plain(),
-        )
-        .unwrap();
+        render_directory_selector(&mut output, &choices, 0, None, None, Theme::plain()).unwrap();
+        let output = String::from_utf8(output).unwrap();
 
-        assert_eq!(selected, current);
-        assert!(String::from_utf8(output).unwrap().contains("Choose a folder to scan"));
+        assert!(output.contains("Choose a folder to scan"));
+        assert!(output.contains("Custom path"));
+        assert!(output.contains("j/k"));
+    }
+
+    #[test]
+    fn truncates_long_paths_from_the_start() {
+        assert_eq!(truncate_start("/one/two/three", 10), "…two/three");
+        assert_eq!(truncate_start("short", 10), "short");
+    }
+
+    #[test]
+    fn wraps_report_text_without_exceeding_the_field_width() {
+        assert_eq!(
+            wrap_text("This explanation is easy to scan", 12),
+            vec!["This", "explanation", "is easy to", "scan"]
+        );
+        assert_eq!(
+            wrap_text("downloads/very-long-folder-name", 10),
+            vec!["downloads/", "very-long-", "folder-nam", "e"]
+        );
     }
 
     #[test]
