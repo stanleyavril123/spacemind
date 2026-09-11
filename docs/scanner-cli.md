@@ -16,10 +16,12 @@ Launch without arguments for the interactive terminal interface:
 cargo run -p spacemind-cli --
 ```
 
-The interface centers itself within wide terminals. Navigate its folder selector with the
-arrow keys or `j`/`k`, press `Enter` to scan the selected folder, press `c` to type a custom
-path, and press `q` to leave safely. Narrow terminals use the available width and shorten
-long paths from the beginning so the most useful final path components remain visible.
+The interface centers itself within wide terminals. Its home menu provides **Scan
+storage**, **Scan history**, and **Quit**, so the normal application flow needs no CLI
+arguments. Navigate with the arrow keys or `j`/`k` and press `Enter` to select. The folder
+selector also accepts `c` for a custom path. Narrow terminals use the available width and
+shorten long paths from the beginning so the most useful final path components remain
+visible. After a report or history view, press `Enter` to return to the home menu.
 
 Human-readable reports use numbered sections in a stable order: overview, safety,
 recommendations, relationships, duplicates, and largest items. Recommendation and relationship
@@ -40,7 +42,39 @@ For structured output:
 cargo run -p spacemind-cli -- scan ~/Downloads --format json
 ```
 
-JSON output includes the complete scan, warnings, metadata, deterministic findings, and duplicate report. It also reports matched ignored paths, protected-item counts, and recommendations withheld by the safety policy. It is intended to become the boundary consumed by SQLite persistence and the desktop interface.
+JSON output includes the complete scan, warnings, metadata, deterministic findings, and duplicate report. It also reports matched ignored paths, protected-item counts, recommendations withheld by the safety policy, and the saved history ID.
+
+## Local scan history
+
+Every successful scan is persisted in SQLite by default. Select **Scan history** from the
+interactive home menu, or use the equivalent scripting commands:
+
+```bash
+spacemind history
+spacemind history --limit 5
+spacemind history --format json
+```
+
+The database stores scan timestamps and totals, item metadata, deterministic
+recommendations, duplicate groups, relationships, warning counts, and matched ignored
+paths. File contents are never stored. Each analysis is written in one transaction, so a
+failed write cannot leave a partial scan in history.
+
+On Linux the default path is `$XDG_DATA_HOME/spacemind/spacemind.db`, or
+`~/.local/share/spacemind/spacemind.db` when `XDG_DATA_HOME` is unset. On Windows it is
+stored below `%LOCALAPPDATA%\SpaceMind`. The active database is automatically excluded
+when it sits inside the scanned directory.
+
+Choose another database with either mechanism:
+
+```bash
+spacemind --database ./development.db scan ~/Downloads
+SPACEMIND_DATABASE=./development.db spacemind history
+```
+
+Disable persistence for one scan with `--no-history`. The initial schema also reserves
+tables for future user decisions, persistent ignore/protection rules, settings, and
+recovered-space tracking; no cleanup action is implemented in this phase.
 
 ## Protected paths and ignore rules
 
