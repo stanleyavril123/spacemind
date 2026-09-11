@@ -9,6 +9,7 @@ use spacemind_core::{
     PathRule, ProgressEvent, RelationshipKind, RelationshipReport, RiskLevel, ScanResult,
     ScannedItem, SuggestedAction,
 };
+use spacemind_db::{default_database_path, Analysis, Database, ScanHistoryEntry};
 use spacemind_duplicates::{detect_duplicates_with_progress, DuplicateOptions};
 use spacemind_relationships::{
     detect_relationships_with_progress, enrich_findings_with_relationships,
@@ -22,7 +23,7 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Parser)]
@@ -34,6 +35,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
                   items worth reviewing. It never deletes files automatically."
 )]
 struct Cli {
+    /// SQLite database path. Defaults to SpaceMind's local user data directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    database: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -42,6 +47,19 @@ struct Cli {
 enum Command {
     /// Scan a folder without modifying its contents.
     Scan(ScanArgs),
+    /// Show locally stored scan history.
+    History(HistoryArgs),
+}
+
+#[derive(Debug, Args)]
+struct HistoryArgs {
+    /// Maximum number of recent scans to show.
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +106,10 @@ struct ScanArgs {
     /// Age at which archives and installers are considered old.
     #[arg(long, default_value_t = 180)]
     old_days: u64,
+
+    /// Do not save this scan to local history.
+    #[arg(long)]
+    no_history: bool,
 }
 
 impl Default for ScanArgs {
@@ -104,6 +126,7 @@ impl Default for ScanArgs {
             no_default_protections: false,
             large_threshold: 1024 * 1024 * 1024,
             old_days: 180,
+            no_history: false,
         }
     }
 }
@@ -121,11 +144,13 @@ struct JsonOutput {
     duplicates: DuplicateReport,
     relationships: RelationshipReport,
     policy: PolicySummary,
+    history_scan_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct PolicySummary {
     ignored_rule_count: usize,
+    automatic_ignore_rule_count: usize,
     protected_rule_count: usize,
     default_protections_enabled: bool,
     ignored_paths: Vec<PathBuf>,
@@ -322,13 +347,264 @@ fn is_interrupted(error: &(dyn Error + 'static)) -> bool {
 }
 
 fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>> {
-    let args = match cli.command {
-        Some(Command::Scan(args)) => args,
-        None => ScanArgs::default(),
-    };
+    let Cli { database, command } = cli;
     let theme = Theme::stdout();
+    match command {
+        Some(Command::History(args)) => run_history(args, database, theme),
+        Some(Command::Scan(args)) => run_scan(args, database, cancellation, theme),
+        None if io::stdin().is_terminal() && io::stdout().is_terminal() && theme.terminal => {
+            run_interactive(database, cancellation, theme)
+        }
+        None => run_scan(ScanArgs::default(), database, cancellation, theme),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveAction {
+    Scan,
+    History,
+    Quit,
+}
+
+fn run_interactive(
+    database_path: Option<PathBuf>,
+    cancellation: &CancellationToken,
+    theme: Theme,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        match choose_main_action(theme)? {
+            InteractiveAction::Scan => {
+                let current = env::current_dir()?;
+                let home = home_directory();
+                let stdout = io::stdout();
+                let mut writer = stdout.lock();
+                let path = match choose_directory(&mut writer, current, home, theme) {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                drop(writer);
+
+                let mut args = ScanArgs::default();
+                args.path = Some(path);
+                run_scan(args, database_path.clone(), cancellation, theme)?;
+            }
+            InteractiveAction::History => run_history(
+                HistoryArgs {
+                    limit: 20,
+                    format: OutputFormat::Human,
+                },
+                database_path.clone(),
+                theme,
+            )?,
+            InteractiveAction::Quit => return Ok(()),
+        }
+
+        if !wait_for_menu(theme)? {
+            return Ok(());
+        }
+    }
+}
+
+fn choose_main_action(theme: Theme) -> io::Result<InteractiveAction> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let mut selected = 0_usize;
+    let actions = [
+        InteractiveAction::Scan,
+        InteractiveAction::History,
+        InteractiveAction::Quit,
+    ];
+    let _raw_mode = RawModeGuard::enter(&mut writer)?;
+
+    let action = loop {
+        render_main_menu(&mut writer, selected, theme)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        if matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        ) {
+            break Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "application closed",
+            ));
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.checked_sub(1).unwrap_or(actions.len() - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1) % actions.len();
+            }
+            KeyCode::Char('s') | KeyCode::Char('1') => break Ok(InteractiveAction::Scan),
+            KeyCode::Char('h') | KeyCode::Char('2') => break Ok(InteractiveAction::History),
+            KeyCode::Char('q') | KeyCode::Char('3') | KeyCode::Esc => {
+                break Ok(InteractiveAction::Quit)
+            }
+            KeyCode::Enter => break Ok(actions[selected]),
+            _ => {}
+        }
+    };
+
+    execute!(
+        writer,
+        cursor::Show,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    action
+}
+
+fn render_main_menu<W: Write>(writer: &mut W, selected: usize, theme: Theme) -> io::Result<()> {
+    let layout = terminal_layout(theme);
+    let lines = main_menu_lines(selected, theme, layout);
+    execute!(writer, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+    let top = layout.selector_top_padding(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        execute!(
+            writer,
+            cursor::MoveTo(layout.margin as u16, (top + index) as u16),
+            crossterm::style::Print(line)
+        )?;
+    }
+    writer.flush()
+}
+
+fn main_menu_lines(selected: usize, theme: Theme, layout: TerminalLayout) -> Vec<String> {
+    let mut lines = brand_header_lines_for_width(theme, "HOME", layout.width).to_vec();
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.accent(truncate_end(
+            "storage, understood.  Private analysis on this computer.",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines.push(String::new());
+    lines.push(format!("  {}", theme.text("What would you like to do?")));
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+
+    let choices = [
+        ("Scan storage", "analyze a folder"),
+        ("Scan history", "review previous results"),
+        ("Quit", "leave without changing files"),
+    ];
+    let label_width = layout.width.saturating_sub(18).clamp(8, 18);
+    let description_width = layout.width.saturating_sub(12 + label_width);
+    for (index, (label, description)) in choices.iter().enumerate() {
+        let marker = if selected == index { "›" } else { " " };
+        let label = pad_right(label, label_width);
+        let choice = format!(" {:02}  {label} ", index + 1);
+        let choice = if selected == index {
+            theme.selected(choice)
+        } else {
+            theme.text(choice)
+        };
+        lines.push(format!(
+            "  {} {choice}  {}",
+            theme.accent(marker),
+            theme.muted(truncate_end(description, description_width))
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+    let help = truncate_end(
+        "↑/↓  j/k move    enter select    q quit",
+        layout.width.saturating_sub(2),
+    );
+    lines.push(format!("  {}", theme.muted(help)));
+    lines
+}
+
+fn wait_for_menu(theme: Theme) -> io::Result<bool> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    write_ui_line(
+        &mut writer,
+        theme,
+        format!("  {}", theme.muted("enter return to menu    q quit")),
+    )?;
+    writer.flush()?;
+    let _raw_mode = RawModeGuard::enter(&mut writer)?;
+
+    let return_to_menu = loop {
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        if matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "application closed",
+            ));
+        }
+        match key.code {
+            KeyCode::Char('q') => break false,
+            KeyCode::Enter | KeyCode::Esc => break true,
+            _ => {}
+        }
+    };
+
+    execute!(
+        writer,
+        cursor::Show,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    Ok(return_to_menu)
+}
+
+fn run_scan(
+    args: ScanArgs,
+    database_path: Option<PathBuf>,
+    cancellation: &CancellationToken,
+    theme: Theme,
+) -> Result<(), Box<dyn Error>> {
+    let history_database_path = if args.no_history {
+        None
+    } else {
+        let path = database_path.map(Ok).unwrap_or_else(default_database_path)?;
+        Some(absolute_path(path)?)
+    };
+    let mut database = history_database_path
+        .as_ref()
+        .map(Database::open)
+        .transpose()?;
     let path = resolve_scan_path(args.path, args.format, theme)?;
-    let ignored_rules = args.ignore;
+    let mut ignored_rules = args.ignore;
+    let user_ignored_rule_count = ignored_rules.len();
+    let mut automatic_ignore_rule_count = 0;
+    if let Some(path) = &history_database_path {
+        let database_rules = database_artifact_paths(path);
+        automatic_ignore_rule_count = database_rules.len();
+        ignored_rules.extend(database_rules.into_iter().map(PathRule::Exact));
+    }
     let mut protected_rules = if args.no_default_protections {
         Vec::new()
     } else {
@@ -388,7 +664,8 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
     progress.finish();
 
     let policy = PolicySummary {
-        ignored_rule_count: ignored_rules.len(),
+        ignored_rule_count: user_ignored_rule_count,
+        automatic_ignore_rule_count,
         protected_rule_count: protected_rules.len(),
         default_protections_enabled: !args.no_default_protections,
         ignored_paths: result.ignored_paths.clone(),
@@ -402,6 +679,20 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
     };
     let mut findings = evaluation.findings;
     enrich_findings_with_relationships(&mut findings, &relationships);
+    let history_scan_id = database
+        .as_mut()
+        .map(|database| {
+            database.save_analysis_with_cancellation(
+                Analysis {
+                    scan: &result,
+                    findings: &findings,
+                    duplicates: &duplicates,
+                    relationships: &relationships,
+                },
+                cancellation,
+            )
+        })
+        .transpose()?;
 
     match args.format {
         OutputFormat::Human => print_human(
@@ -412,6 +703,7 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
             &policy,
             args.top,
             args.min_size,
+            history_scan_id,
             theme,
         ),
         OutputFormat::Json => println!(
@@ -422,10 +714,48 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
                 duplicates,
                 relationships,
                 policy,
+                history_scan_id,
             })?
         ),
     }
     Ok(())
+}
+
+fn run_history(
+    args: HistoryArgs,
+    database_path: Option<PathBuf>,
+    theme: Theme,
+) -> Result<(), Box<dyn Error>> {
+    let path = database_path.map(Ok).unwrap_or_else(default_database_path)?;
+    let path = absolute_path(path)?;
+    let database = Database::open(&path)?;
+    let history = database.scan_history(args.limit)?;
+    match args.format {
+        OutputFormat::Human => print_history(&history, &path, theme),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&history)?),
+    }
+    Ok(())
+}
+
+fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
+fn database_artifact_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![path.to_path_buf()];
+    let Some(file_name) = path.file_name() else {
+        return paths;
+    };
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = file_name.to_os_string();
+        sidecar.push(suffix);
+        paths.push(path.with_file_name(sidecar));
+    }
+    paths
 }
 
 fn resolve_scan_path(
@@ -1136,6 +1466,7 @@ fn print_human(
     policy: &PolicySummary,
     top: usize,
     min_size: u64,
+    history_scan_id: Option<i64>,
     theme: Theme,
 ) {
     ui_println!(theme);
@@ -1196,6 +1527,20 @@ fn print_human(
             RecordTone::Warning,
         );
     }
+    match history_scan_id {
+        Some(scan_id) => print_metric(
+            theme,
+            "history",
+            &format!("saved locally as scan #{scan_id}"),
+            RecordTone::Positive,
+        ),
+        None => print_metric(
+            theme,
+            "history",
+            "disabled for this scan",
+            RecordTone::Text,
+        ),
+    }
 
     print_section(
         "02",
@@ -1221,9 +1566,10 @@ fn print_human(
         theme,
         "ignored",
         &format!(
-            "{} matched paths • {} configured rules • not scanned",
+            "{} matched paths • {} user rules • {} automatic rules • not scanned",
             policy.ignored_paths.len(),
-            policy.ignored_rule_count
+            policy.ignored_rule_count,
+            policy.automatic_ignore_rule_count
         ),
         RecordTone::Text,
     );
@@ -1625,6 +1971,118 @@ fn print_human(
         theme.green("Nothing was deleted or modified.")
     );
     ui_println!(theme);
+}
+
+fn print_history(entries: &[ScanHistoryEntry], database_path: &Path, theme: Theme) {
+    ui_println!(theme);
+    print_brand_header(theme, "REPORT");
+    print_section(
+        "01",
+        "SCAN HISTORY",
+        "Previous analyses stored only on this computer",
+        theme,
+    );
+    print_metric(
+        theme,
+        "database",
+        &database_path.display().to_string(),
+        RecordTone::Text,
+    );
+    print_metric(
+        theme,
+        "scans shown",
+        &format_count(entries.len() as u64),
+        RecordTone::Accent,
+    );
+
+    if entries.is_empty() {
+        ui_println!(theme);
+        ui_println!(
+            theme,
+            "  {} {}",
+            theme.muted("—"),
+            theme.text("No scan history yet. Run spacemind to create the first entry.")
+        );
+    } else {
+        for entry in entries {
+            print_record_divider(theme);
+            ui_println!(
+                theme,
+                "  {}  {}",
+                theme.selected(format!(" #{:<4} ", entry.id)),
+                theme.text(entry.root.display().to_string())
+            );
+            print_record_field(
+                theme,
+                "analyzed",
+                &format_bytes(entry.total_size_bytes),
+                RecordTone::Text,
+            );
+            print_record_field(
+                theme,
+                "contents",
+                &format!(
+                    "{} files • {} folders",
+                    format_count(entry.file_count),
+                    format_count(entry.directory_count)
+                ),
+                RecordTone::Text,
+            );
+            print_record_field(
+                theme,
+                "results",
+                &format!(
+                    "{} recommendations • {} duplicate groups • {} relationships",
+                    format_count(entry.recommendation_count),
+                    format_count(entry.duplicate_group_count),
+                    format_count(entry.relationship_count)
+                ),
+                RecordTone::Accent,
+            );
+            if let Some(bytes) = entry.duplicate_recovery_bytes {
+                print_record_field(
+                    theme,
+                    "recoverable",
+                    &format_bytes(bytes),
+                    RecordTone::Positive,
+                );
+            }
+            print_record_field(
+                theme,
+                "completed",
+                &format_age(entry.completed_at_epoch_seconds),
+                RecordTone::Text,
+            );
+        }
+    }
+
+    ui_println!(theme);
+    ui_println!(
+        theme,
+        "  {}",
+        theme.border("─".repeat(terminal_width(theme).saturating_sub(4)))
+    );
+    ui_println!(
+        theme,
+        "  {} {}",
+        theme.green("✓"),
+        theme.green("History contains metadata only, never file contents.")
+    );
+    ui_println!(theme);
+}
+
+fn format_age(epoch_seconds: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(epoch_seconds);
+    let elapsed = now.saturating_sub(epoch_seconds);
+    match elapsed {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{} minutes ago", elapsed / 60),
+        3_600..=86_399 => format!("{} hours ago", elapsed / 3_600),
+        _ => format!("{} days ago", elapsed / 86_400),
+    }
 }
 
 fn print_report_index(theme: Theme) {
@@ -2070,6 +2528,16 @@ mod tests {
 
         assert!(lines.iter().all(|line| display_width(line) <= layout.width));
         assert!(lines[1].contains("[scan]"));
+    }
+
+    #[test]
+    fn home_menu_is_navigable_without_colors_and_fits_a_small_canvas() {
+        let layout = TerminalLayout::for_size(32, 24);
+        let lines = main_menu_lines(1, Theme::plain(), layout);
+
+        assert!(lines.iter().all(|line| display_width(line) <= layout.width));
+        assert!(lines.iter().any(|line| line.contains("›  02")));
+        assert!(lines.iter().any(|line| line.contains("Scan history")));
     }
 
     #[test]

@@ -1,0 +1,13 @@
+[package]
+name = "spacemind-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+spacemind-core.workspace = true
+thiserror.workspace = true
