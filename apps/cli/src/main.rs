@@ -4,10 +4,11 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
 use serde::Serialize;
+use spacemind_ai::{analyze_with_ollama, AiError, OllamaOptions};
 use spacemind_core::{
-    AnalysisPhase, CancellationToken, DuplicateReport, Finding, FindingCategory, ItemKind,
-    PathRule, ProgressEvent, RelationshipKind, RelationshipReport, RiskLevel, ScanResult,
-    ScannedItem, SuggestedAction,
+    AiReport, AiStatus, AiSuggestedAction, AnalysisPhase, CancellationToken, DuplicateReport,
+    Finding, FindingCategory, ItemKind, PathRule, ProgressEvent, RelationshipKind,
+    RelationshipReport, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
 };
 use spacemind_db::{default_database_path, Analysis, Database, ScanHistoryEntry};
 use spacemind_duplicates::{detect_duplicates_with_progress, DuplicateOptions};
@@ -110,6 +111,22 @@ struct ScanArgs {
     /// Do not save this scan to local history.
     #[arg(long)]
     no_history: bool,
+
+    /// Do not ask a local Ollama model to explain ambiguous candidates.
+    #[arg(long)]
+    no_ai: bool,
+
+    /// Locally installed Ollama model used for explanations.
+    #[arg(long, default_value = "qwen3:4b")]
+    ollama_model: String,
+
+    /// Local Ollama API endpoint. Remote endpoints are rejected.
+    #[arg(long, default_value = "http://127.0.0.1:11434")]
+    ollama_url: String,
+
+    /// Maximum shortlisted items sent to the local model (capped at 32).
+    #[arg(long, default_value_t = 8)]
+    ai_limit: usize,
 }
 
 impl Default for ScanArgs {
@@ -127,6 +144,10 @@ impl Default for ScanArgs {
             large_threshold: 1024 * 1024 * 1024,
             old_days: 180,
             no_history: false,
+            no_ai: false,
+            ollama_model: "qwen3:4b".to_owned(),
+            ollama_url: "http://127.0.0.1:11434".to_owned(),
+            ai_limit: 8,
         }
     }
 }
@@ -143,6 +164,7 @@ struct JsonOutput {
     findings: Vec<Finding>,
     duplicates: DuplicateReport,
     relationships: RelationshipReport,
+    ai: AiReport,
     policy: PolicySummary,
     history_scan_id: Option<i64>,
 }
@@ -341,7 +363,8 @@ fn main() -> ExitCode {
 }
 
 fn is_interrupted(error: &(dyn Error + 'static)) -> bool {
-    error
+    error.downcast_ref::<AiError>().is_some_and(|error| matches!(error, AiError::Cancelled))
+        || error
         .downcast_ref::<io::Error>()
         .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted)
 }
@@ -653,16 +676,6 @@ fn run_scan(
         cancellation,
         |event| progress.report(event),
     )?;
-    progress.report(&ProgressEvent {
-        phase: AnalysisPhase::Complete,
-        items_processed: recommendation_total,
-        bytes_processed: result.total_size_bytes,
-        total_items: Some(recommendation_total),
-        total_bytes: Some(result.total_size_bytes),
-        current_path: None,
-    });
-    progress.finish();
-
     let policy = PolicySummary {
         ignored_rule_count: user_ignored_rule_count,
         automatic_ignore_rule_count,
@@ -679,6 +692,33 @@ fn run_scan(
     };
     let mut findings = evaluation.findings;
     enrich_findings_with_relationships(&mut findings, &relationships);
+    let ai = if args.no_ai {
+        AiReport::disabled()
+    } else {
+        analyze_with_ollama(
+            &result,
+            &findings,
+            &duplicates,
+            &relationships,
+            &OllamaOptions {
+                endpoint: args.ollama_url,
+                model: args.ollama_model,
+                maximum_candidates: args.ai_limit,
+                ..OllamaOptions::default()
+            },
+            cancellation,
+            |event| progress.report(event),
+        )?
+    };
+    progress.report(&ProgressEvent {
+        phase: AnalysisPhase::Complete,
+        items_processed: recommendation_total,
+        bytes_processed: result.total_size_bytes,
+        total_items: Some(recommendation_total),
+        total_bytes: Some(result.total_size_bytes),
+        current_path: None,
+    });
+    progress.finish();
     let history_scan_id = database
         .as_mut()
         .map(|database| {
@@ -688,6 +728,7 @@ fn run_scan(
                     findings: &findings,
                     duplicates: &duplicates,
                     relationships: &relationships,
+                    ai: &ai,
                 },
                 cancellation,
             )
@@ -700,6 +741,7 @@ fn run_scan(
             &findings,
             &duplicates,
             &relationships,
+            &ai,
             &policy,
             args.top,
             args.min_size,
@@ -713,6 +755,7 @@ fn run_scan(
                 findings,
                 duplicates,
                 relationships,
+                ai,
                 policy,
                 history_scan_id,
             })?
@@ -1300,6 +1343,7 @@ impl CliProgress {
             AnalysisPhase::HashingDuplicates => self.theme.accent(&message),
             AnalysisPhase::BuildingRecommendations => self.theme.yellow(&message),
             AnalysisPhase::DetectingRelationships => self.theme.aqua(&message),
+            AnalysisPhase::ExplainingCandidates => self.theme.aqua(&message),
             AnalysisPhase::Complete => self.theme.green(&message),
         };
         eprint!("\r\x1b[2K{}  {rendered}", ui_margin(self.theme));
@@ -1338,6 +1382,7 @@ fn progress_message(event: &ProgressEvent) -> String {
         AnalysisPhase::HashingDuplicates => "Checking duplicates",
         AnalysisPhase::BuildingRecommendations => "Building advice",
         AnalysisPhase::DetectingRelationships => "Connecting context",
+        AnalysisPhase::ExplainingCandidates => "Explaining context",
         AnalysisPhase::Complete => unreachable!(),
     };
     let progress = match event.total_items {
@@ -1463,6 +1508,7 @@ fn print_human(
     findings: &[Finding],
     duplicates: &DuplicateReport,
     relationships: &RelationshipReport,
+    ai: &AiReport,
     policy: &PolicySummary,
     top: usize,
     min_size: u64,
@@ -1541,6 +1587,28 @@ fn print_human(
             RecordTone::Text,
         ),
     }
+    let (ai_label, ai_tone) = match &ai.status {
+        AiStatus::Disabled => ("disabled by user".to_owned(), RecordTone::Text),
+        AiStatus::NoCandidates => (
+            "not needed • no ambiguous candidates".to_owned(),
+            RecordTone::Positive,
+        ),
+        AiStatus::Unavailable { reason } => {
+            (format!("unavailable • {reason}"), RecordTone::Warning)
+        }
+        AiStatus::Complete { model } => (
+            format!("{model} • {} local explanations", ai.explanations.len()),
+            RecordTone::Positive,
+        ),
+        AiStatus::Partial { model } => (
+            format!(
+                "{model} • {} explanations • some output rejected",
+                ai.explanations.len()
+            ),
+            RecordTone::Warning,
+        ),
+    };
+    print_metric(theme, "local AI", &ai_label, ai_tone);
 
     print_section(
         "02",
@@ -1630,6 +1698,7 @@ fn print_human(
             theme.accent(format!("{} candidates", findings.len())),
             theme.muted("• suggestions only, never automatic deletions")
         );
+        let mut explained_paths = HashSet::new();
         for (index, finding) in findings.iter().take(top).enumerate() {
             if index > 0 {
                 print_record_divider(theme);
@@ -1671,6 +1740,31 @@ fn print_human(
                     print_wrapped_bullet(
                         theme,
                         &humanize_evidence(evidence),
+                    );
+                }
+            }
+            if explained_paths.insert(&finding.path) {
+                if let Some(explanation) = ai
+                    .explanations
+                    .iter()
+                    .find(|explanation| explanation.path == finding.path)
+                {
+                    ui_println!(
+                        theme,
+                        "      {}",
+                        theme.muted("local AI context • advisory only")
+                    );
+                    print_wrapped_bullet(theme, &explanation.reason);
+                    print_record_field(
+                        theme,
+                        "AI assessment",
+                        &format!(
+                            "{} risk • {:.0}% confidence • {}",
+                            risk_label(explanation.risk),
+                            explanation.confidence * 100.0,
+                            ai_action_label(explanation.suggested_action)
+                        ),
+                        risk_tone(explanation.risk),
                     );
                 }
             }
@@ -2039,6 +2133,15 @@ fn print_history(entries: &[ScanHistoryEntry], database_path: &Path, theme: Them
                 ),
                 RecordTone::Accent,
             );
+            let ai_history = match &entry.ai_model {
+                Some(model) => format!(
+                    "{} • {} explanations",
+                    model,
+                    format_count(entry.ai_explanation_count)
+                ),
+                None => entry.ai_status.replace('_', " "),
+            };
+            print_record_field(theme, "local AI", &ai_history, RecordTone::Text);
             if let Some(bytes) = entry.duplicate_recovery_bytes {
                 print_record_field(
                     theme,
@@ -2361,6 +2464,14 @@ fn action_label(action: SuggestedAction) -> &'static str {
     match action {
         SuggestedAction::ReviewForDeletion => "Review before deleting",
         SuggestedAction::ReviewForArchive => "Review for archiving",
+    }
+}
+
+fn ai_action_label(action: AiSuggestedAction) -> &'static str {
+    match action {
+        AiSuggestedAction::ReviewForDeletion => "review for deletion",
+        AiSuggestedAction::ReviewForArchive => "review for archive",
+        AiSuggestedAction::KeepOrReview => "keep or inspect manually",
     }
 }
 

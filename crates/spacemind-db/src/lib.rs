@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use spacemind_core::{
-    CancellationToken, DuplicateReport, Finding, RelationshipReport, ScanResult, ScannedItem,
+    AiReport, AiStatus, CancellationToken, DuplicateReport, Finding, RelationshipReport,
+    ScanResult, ScannedItem,
 };
 use std::env;
 use std::ffi::OsString;
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = r#"
 BEGIN IMMEDIATE;
@@ -143,6 +144,32 @@ PRAGMA user_version = 1;
 COMMIT;
 "#;
 
+const SCHEMA_V2: &str = r#"
+BEGIN IMMEDIATE;
+
+ALTER TABLE scans ADD COLUMN ai_status TEXT NOT NULL DEFAULT 'disabled';
+ALTER TABLE scans ADD COLUMN ai_model TEXT;
+ALTER TABLE scans ADD COLUMN ai_status_detail TEXT;
+ALTER TABLE scans ADD COLUMN ai_candidate_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE scans ADD COLUMN ai_warning_count INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE ai_explanations (
+    id INTEGER PRIMARY KEY,
+    scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    path BLOB NOT NULL,
+    category TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    suggested_action TEXT NOT NULL
+);
+
+CREATE INDEX ai_explanations_scan_idx ON ai_explanations(scan_id);
+
+PRAGMA user_version = 2;
+COMMIT;
+"#;
+
 #[derive(Debug, Error)]
 pub enum DatabaseError {
     #[error("cannot create database directory {path}: {source}")]
@@ -176,6 +203,7 @@ pub struct Analysis<'a> {
     pub findings: &'a [Finding],
     pub duplicates: &'a DuplicateReport,
     pub relationships: &'a RelationshipReport,
+    pub ai: &'a AiReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +223,10 @@ pub struct ScanHistoryEntry {
     pub warning_count: u64,
     pub duplicate_recovery_bytes: Option<u64>,
     pub recovered_space_bytes: u64,
+    pub ai_status: String,
+    pub ai_model: Option<String>,
+    pub ai_candidate_count: u64,
+    pub ai_explanation_count: u64,
 }
 
 impl Database {
@@ -227,7 +259,11 @@ impl Database {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         match version {
-            0 => self.connection.execute_batch(SCHEMA_V1)?,
+            0 => {
+                self.connection.execute_batch(SCHEMA_V1)?;
+                self.connection.execute_batch(SCHEMA_V2)?;
+            }
+            1 => self.connection.execute_batch(SCHEMA_V2)?,
             SCHEMA_VERSION => {}
             found => {
                 return Err(DatabaseError::UnsupportedSchemaVersion {
@@ -266,6 +302,7 @@ impl Database {
             analysis.relationships,
             cancellation,
         )?;
+        insert_ai_explanations(&transaction, scan_id, analysis.ai, cancellation)?;
         insert_ignored_paths(&transaction, scan_id, analysis.scan, cancellation)?;
         check_cancelled(cancellation)?;
         transaction.commit()?;
@@ -282,7 +319,8 @@ impl Database {
                     total_allocated_size_bytes, file_count, directory_count, \
                     recommendation_count, duplicate_group_count, relationship_count, \
                     scan_warning_count + duplicate_warning_count, duplicate_recovery_bytes, \
-                    recovered_space_bytes \
+                    recovered_space_bytes, ai_status, ai_model, ai_candidate_count, \
+                    (SELECT COUNT(*) FROM ai_explanations WHERE scan_id = scans.id) \
              FROM scans ORDER BY completed_at DESC, id DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit], read_history_row)?;
@@ -297,7 +335,8 @@ impl Database {
                         total_allocated_size_bytes, file_count, directory_count, \
                         recommendation_count, duplicate_group_count, relationship_count, \
                         scan_warning_count + duplicate_warning_count, duplicate_recovery_bytes, \
-                        recovered_space_bytes \
+                        recovered_space_bytes, ai_status, ai_model, ai_candidate_count, \
+                        (SELECT COUNT(*) FROM ai_explanations WHERE scan_id = scans.id) \
                  FROM scans WHERE id = ?1",
                 [scan_id],
                 read_history_row,
@@ -343,12 +382,14 @@ pub fn default_database_path() -> Result<PathBuf> {
 
 fn insert_scan(transaction: &Transaction<'_>, analysis: Analysis<'_>) -> Result<i64> {
     let scan = analysis.scan;
+    let (ai_status, ai_model, ai_status_detail) = ai_status_parts(&analysis.ai.status);
     transaction.execute(
         "INSERT INTO scans (root_path, started_at, completed_at, total_size_bytes, \
          total_allocated_size_bytes, file_count, directory_count, scan_warning_count, \
          duplicate_warning_count, recommendation_count, duplicate_group_count, \
-         relationship_count, duplicate_recovery_bytes) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         relationship_count, duplicate_recovery_bytes, ai_status, ai_model, ai_status_detail, \
+         ai_candidate_count, ai_warning_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             path_bytes(&scan.root),
             integer(scan.started_at_epoch_seconds, "scan.started_at")?,
@@ -366,6 +407,11 @@ fn insert_scan(transaction: &Transaction<'_>, analysis: Analysis<'_>) -> Result<
                 analysis.duplicates.potential_recovery_allocated_bytes,
                 "duplicate.potential_recovery_allocated_bytes"
             )?,
+            ai_status,
+            ai_model,
+            ai_status_detail,
+            integer(analysis.ai.candidates_considered, "ai.candidate_count")?,
+            integer(analysis.ai.warnings.len() as u64, "ai.warning_count")?,
         ],
     )?;
     Ok(transaction.last_insert_rowid())
@@ -550,6 +596,41 @@ fn insert_ignored_paths(
     Ok(())
 }
 
+fn insert_ai_explanations(
+    transaction: &Transaction<'_>,
+    scan_id: i64,
+    ai: &AiReport,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut statement = transaction.prepare_cached(
+        "INSERT INTO ai_explanations (scan_id, path, category, risk, confidence, reason, \
+         suggested_action) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for explanation in &ai.explanations {
+        check_cancelled(cancellation)?;
+        statement.execute(params![
+            scan_id,
+            path_bytes(&explanation.path),
+            serialized_name(&explanation.category)?,
+            serialized_name(&explanation.risk)?,
+            f64::from(explanation.confidence),
+            explanation.reason,
+            serialized_name(&explanation.suggested_action)?,
+        ])?;
+    }
+    Ok(())
+}
+
+fn ai_status_parts(status: &AiStatus) -> (&'static str, Option<&str>, Option<&str>) {
+    match status {
+        AiStatus::Disabled => ("disabled", None, None),
+        AiStatus::NoCandidates => ("no_candidates", None, None),
+        AiStatus::Unavailable { reason } => ("unavailable", None, Some(reason)),
+        AiStatus::Complete { model } => ("complete", Some(model), None),
+        AiStatus::Partial { model } => ("partial", Some(model), None),
+    }
+}
+
 fn validate_analysis_numbers(analysis: Analysis<'_>) -> Result<()> {
     integer(analysis.scan.started_at_epoch_seconds, "scan.started_at")?;
     integer(analysis.scan.completed_at_epoch_seconds, "scan.completed_at")?;
@@ -616,6 +697,10 @@ fn read_history_row(row: &Row<'_>) -> rusqlite::Result<ScanHistoryEntry> {
             "duplicate_recovery_bytes",
         )?,
         recovered_space_bytes: stored_integer(row.get(13)?, "recovered_space_bytes")?,
+        ai_status: row.get(14)?,
+        ai_model: row.get(15)?,
+        ai_candidate_count: stored_integer(row.get(16)?, "ai_candidate_count")?,
+        ai_explanation_count: stored_integer(row.get(17)?, "ai_explanation_count")?,
     })
 }
 
@@ -690,8 +775,8 @@ fn invalid_path_blob(bytes: Vec<u8>) -> rusqlite::Error {
 mod tests {
     use super::*;
     use spacemind_core::{
-        DuplicateEntry, DuplicateGroup, FileIdentity, FindingCategory, ItemKind, Relationship,
-        RelationshipKind, RiskLevel, SuggestedAction,
+        AiCategory, AiExplanation, AiSuggestedAction, DuplicateEntry, DuplicateGroup, FileIdentity,
+        FindingCategory, ItemKind, Relationship, RelationshipKind, RiskLevel, SuggestedAction,
     };
 
     fn sample_scan() -> ScanResult {
@@ -774,6 +859,24 @@ mod tests {
         }
     }
 
+    fn sample_ai() -> AiReport {
+        AiReport {
+            status: AiStatus::Complete {
+                model: "qwen3:4b".to_owned(),
+            },
+            candidates_considered: 1,
+            explanations: vec![AiExplanation {
+                path: PathBuf::from("/home/example/Downloads/archive.zip"),
+                category: AiCategory::ArchiveWithExtractedCopy,
+                risk: RiskLevel::Low,
+                confidence: 0.91,
+                reason: "An extracted sibling was found; inspect both before deciding.".to_owned(),
+                suggested_action: AiSuggestedAction::ReviewForDeletion,
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn migrates_an_empty_database_and_persists_a_complete_analysis() {
         let mut database = Database::open_in_memory().unwrap();
@@ -781,6 +884,7 @@ mod tests {
         let findings = vec![sample_finding()];
         let duplicates = sample_duplicates();
         let relationships = sample_relationships();
+        let ai = sample_ai();
 
         let id = database
             .save_analysis(Analysis {
@@ -788,6 +892,7 @@ mod tests {
                 findings: &findings,
                 duplicates: &duplicates,
                 relationships: &relationships,
+                ai: &ai,
             })
             .unwrap();
 
@@ -798,12 +903,15 @@ mod tests {
         assert_eq!(database.row_count("duplicate_groups"), 1);
         assert_eq!(database.row_count("duplicate_entries"), 1);
         assert_eq!(database.row_count("relationships"), 1);
+        assert_eq!(database.row_count("ai_explanations"), 1);
         assert_eq!(database.row_count("ignored_paths"), 1);
 
         let history = database.scan_history(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].root, scan.root);
         assert_eq!(history[0].duplicate_recovery_bytes, Some(16));
+        assert_eq!(history[0].ai_model.as_deref(), Some("qwen3:4b"));
+        assert_eq!(history[0].ai_explanation_count, 1);
         assert_eq!(database.scan(id).unwrap(), Some(history[0].clone()));
     }
 
@@ -817,6 +925,7 @@ mod tests {
         second.completed_at_epoch_seconds = 300;
         let duplicates = sample_duplicates();
         let relationships = sample_relationships();
+        let ai = sample_ai();
 
         for scan in [&first, &second] {
             database
@@ -825,6 +934,7 @@ mod tests {
                     findings: &[],
                     duplicates: &duplicates,
                     relationships: &relationships,
+                    ai: &ai,
                 })
                 .unwrap();
         }
@@ -842,6 +952,7 @@ mod tests {
         scan.total_size_bytes = u64::MAX;
         let duplicates = sample_duplicates();
         let relationships = sample_relationships();
+        let ai = sample_ai();
 
         let error = database
             .save_analysis(Analysis {
@@ -849,6 +960,7 @@ mod tests {
                 findings: &[],
                 duplicates: &duplicates,
                 relationships: &relationships,
+                ai: &ai,
             })
             .unwrap_err();
 
@@ -862,6 +974,7 @@ mod tests {
         let scan = sample_scan();
         let duplicates = sample_duplicates();
         let relationships = sample_relationships();
+        let ai = sample_ai();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -872,6 +985,7 @@ mod tests {
                     findings: &[],
                     duplicates: &duplicates,
                     relationships: &relationships,
+                    ai: &ai,
                 },
                 &cancellation,
             )
@@ -884,17 +998,39 @@ mod tests {
     #[test]
     fn rejects_a_newer_or_unknown_schema() {
         let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch("PRAGMA user_version = 2;").unwrap();
+        connection.execute_batch("PRAGMA user_version = 3;").unwrap();
 
         let error = Database::initialize(connection).unwrap_err();
 
         assert!(matches!(
             error,
             DatabaseError::UnsupportedSchemaVersion {
-                found: 2,
+                found: 3,
                 supported: SCHEMA_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn migrates_a_version_one_database_without_losing_scans() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO scans (root_path, started_at, completed_at, total_size_bytes, \
+                 file_count, directory_count, scan_warning_count, duplicate_warning_count, \
+                 recommendation_count, duplicate_group_count, relationship_count, \
+                 recovered_space_bytes) VALUES (?1, 1, 2, 3, 1, 1, 0, 0, 0, 0, 0, 0)",
+                [path_bytes(Path::new("/tmp"))],
+            )
+            .unwrap();
+
+        let database = Database::initialize(connection).unwrap();
+        let history = database.scan_history(1).unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].ai_status, "disabled");
+        assert_eq!(history[0].ai_explanation_count, 0);
     }
 
     #[cfg(unix)]
@@ -912,6 +1048,7 @@ mod tests {
         scan.items = vec![first, second];
         let duplicates = sample_duplicates();
         let relationships = sample_relationships();
+        let ai = sample_ai();
 
         database
             .save_analysis(Analysis {
@@ -919,6 +1056,7 @@ mod tests {
                 findings: &[],
                 duplicates: &duplicates,
                 relationships: &relationships,
+                ai: &ai,
             })
             .unwrap();
 
