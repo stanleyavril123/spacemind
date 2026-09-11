@@ -12,6 +12,7 @@ pub enum AnalysisPhase {
     HashingDuplicates,
     BuildingRecommendations,
     DetectingRelationships,
+    ExplainingCandidates,
     Complete,
 }
 

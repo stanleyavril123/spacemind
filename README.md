@@ -42,8 +42,31 @@ spacemind scan ~ --ignore "**/.git/**" --ignore "node_modules"
 ```
 
 During the scan, SpaceMind reports progress for filesystem scanning, duplicate hashing,
-relationship detection, and recommendation building. Press `Ctrl+C` to cancel safely. The analysis is read-only;
-no files are moved, deleted, or uploaded.
+relationship detection, recommendation building, and optional local explanations. Press
+`Ctrl+C` to cancel safely. The analysis is read-only; no files are moved, deleted, or uploaded.
+
+## Local explanations with Ollama
+
+When [Ollama](https://ollama.com/) is running, SpaceMind asks a locally installed model to
+explain a small shortlist of ambiguous recommendations. Install the default model once:
+
+```bash
+ollama pull qwen3:4b
+```
+
+Then run `spacemind` normally. SpaceMind sends only structured filesystem metadata such as
+paths, sizes, ages, classifications, and detected relationships to the loopback Ollama API.
+It never sends file contents, never connects to a remote model endpoint, and never treats a
+model response as deletion permission.
+
+If Ollama is stopped or the model is missing, the deterministic scan still completes and the
+report explains why local AI was unavailable. Use another installed local model with
+`--ollama-model`, limit the shortlist with `--ai-limit`, or disable this layer with `--no-ai`:
+
+```bash
+spacemind scan ~/Downloads --ollama-model gemma3:4b
+spacemind scan ~/Downloads --no-ai
+```
 
 For machine-readable output:
 

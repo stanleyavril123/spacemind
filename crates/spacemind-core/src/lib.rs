@@ -187,3 +187,65 @@ pub struct RelationshipReport {
     pub relationships: Vec<Relationship>,
     pub items_analyzed: u64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiCategory {
+    ReplaceableInstaller,
+    ArchiveWithExtractedCopy,
+    CacheOrGenerated,
+    DuplicateCopy,
+    UserDataOrState,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiSuggestedAction {
+    ReviewForDeletion,
+    ReviewForArchive,
+    KeepOrReview,
+}
+
+/// A local model's explanation of deterministic filesystem metadata.
+///
+/// This is advisory context only. It never changes a deterministic finding or
+/// grants permission to modify a file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiExplanation {
+    pub path: PathBuf,
+    pub category: AiCategory,
+    pub risk: RiskLevel,
+    pub confidence: f32,
+    pub reason: String,
+    pub suggested_action: AiSuggestedAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AiStatus {
+    Disabled,
+    NoCandidates,
+    Unavailable { reason: String },
+    Complete { model: String },
+    Partial { model: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiReport {
+    pub status: AiStatus,
+    pub candidates_considered: u64,
+    pub explanations: Vec<AiExplanation>,
+    pub warnings: Vec<String>,
+}
+
+impl AiReport {
+    pub fn disabled() -> Self {
+        Self {
+            status: AiStatus::Disabled,
+            candidates_considered: 0,
+            explanations: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
