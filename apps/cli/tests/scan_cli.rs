@@ -41,6 +41,7 @@ fn scans_a_directory_and_emits_duplicate_json() {
             "json",
             "--duplicate-min-size",
             "1B",
+            "--no-history",
         ])
         .output()
         .unwrap();
@@ -85,6 +86,7 @@ fn applies_ignore_and_protect_rules_end_to_end() {
             "--protect",
             protected.to_str().unwrap(),
             "--no-default-protections",
+            "--no-history",
         ])
         .output()
         .unwrap();
@@ -134,6 +136,7 @@ fn emits_specific_deterministic_categories_in_json() {
             "json",
             "--large-threshold",
             "1GiB",
+            "--no-history",
         ])
         .output()
         .unwrap();
@@ -177,10 +180,12 @@ fn emits_specific_deterministic_categories_in_json() {
 #[test]
 fn zero_argument_launch_scans_the_current_directory_without_a_terminal() {
     let directory = TestDirectory::new();
+    let state = TestDirectory::new();
     fs::write(directory.0.join("example.bin"), [7_u8; 16]).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
         .current_dir(&directory.0)
+        .env("SPACEMIND_DATABASE", state.0.join("history.db"))
         .output()
         .unwrap();
 
@@ -189,4 +194,87 @@ fn zero_argument_launch_scans_the_current_directory_without_a_terminal() {
     assert!(report.contains("SPACEMIND"));
     assert!(report.contains("worth reviewing"));
     assert!(report.contains("Nothing was deleted or modified"));
+}
+
+#[test]
+fn persists_a_scan_and_lists_it_from_history() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("history.db");
+    fs::write(directory.0.join("example.bin"), [7_u8; 16]).unwrap();
+
+    let scan_output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .arg("--database")
+        .arg(&database)
+        .args([
+            "scan",
+            directory.0.to_str().unwrap(),
+            "--format",
+            "json",
+            "--duplicate-min-size",
+            "1B",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        scan_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scan_output.stderr)
+    );
+    let scan_json: Value = serde_json::from_slice(&scan_output.stdout).unwrap();
+    assert_eq!(scan_json["history_scan_id"], 1);
+    assert_eq!(scan_json["scan"]["file_count"], 1);
+    assert_eq!(scan_json["scan"]["total_size_bytes"], 16);
+    assert!(scan_json["scan"]["ignored_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path.as_str() == database.canonicalize().unwrap().to_str()));
+
+    let history_output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .arg("--database")
+        .arg(&database)
+        .args(["history", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        history_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history_output.stderr)
+    );
+    let history: Value = serde_json::from_slice(&history_output.stdout).unwrap();
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["id"], 1);
+    assert_eq!(
+        history[0]["root"],
+        directory.0.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(history[0]["file_count"], 1);
+}
+
+#[test]
+fn no_history_does_not_create_a_database() {
+    let directory = TestDirectory::new();
+    let state = TestDirectory::new();
+    let database = state.0.join("history.db");
+    fs::write(directory.0.join("example.bin"), [7_u8; 16]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .arg("--database")
+        .arg(&database)
+        .args([
+            "scan",
+            directory.0.to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-history",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["history_scan_id"].is_null());
+    assert!(!database.exists());
 }
