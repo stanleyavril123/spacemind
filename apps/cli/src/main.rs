@@ -10,7 +10,9 @@ use spacemind_core::{
     Finding, FindingCategory, ItemKind, PathRule, ProgressEvent, RelationshipKind,
     RelationshipReport, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
 };
-use spacemind_db::{default_database_path, Analysis, Database, ScanHistoryEntry};
+use spacemind_db::{
+    default_database_path, Analysis, Database, ScanHistoryEntry, StoredAnalysis,
+};
 use spacemind_duplicates::{detect_duplicates_with_progress, DuplicateOptions};
 use spacemind_relationships::{
     detect_relationships_with_progress, enrich_findings_with_relationships,
@@ -374,11 +376,13 @@ fn run(cli: Cli, cancellation: &CancellationToken) -> Result<(), Box<dyn Error>>
     let theme = Theme::stdout();
     match command {
         Some(Command::History(args)) => run_history(args, database, theme),
-        Some(Command::Scan(args)) => run_scan(args, database, cancellation, theme),
+        Some(Command::Scan(args)) => {
+            run_scan(args, database, cancellation, theme, true).map(|_| ())
+        }
         None if io::stdin().is_terminal() && io::stdout().is_terminal() && theme.terminal => {
             run_interactive(database, cancellation, theme)
         }
-        None => run_scan(ScanArgs::default(), database, cancellation, theme),
+        None => run_scan(ScanArgs::default(), database, cancellation, theme, true).map(|_| ()),
     }
 }
 
@@ -394,6 +398,8 @@ fn run_interactive(
     cancellation: &CancellationToken,
     theme: Theme,
 ) -> Result<(), Box<dyn Error>> {
+    let database_path = database_path.map(Ok).unwrap_or_else(default_database_path)?;
+    let database_path = absolute_path(database_path)?;
     loop {
         match choose_main_action(theme)? {
             InteractiveAction::Scan => {
@@ -410,21 +416,21 @@ fn run_interactive(
 
                 let mut args = ScanArgs::default();
                 args.path = Some(path);
-                run_scan(args, database_path.clone(), cancellation, theme)?;
+                if let Some(scan_id) = run_scan(
+                    args,
+                    Some(database_path.clone()),
+                    cancellation,
+                    theme,
+                    false,
+                )? {
+                    let database = Database::open(&database_path)?;
+                    if let Some(analysis) = database.analysis(scan_id)? {
+                        review_analysis(&analysis, theme)?;
+                    }
+                }
             }
-            InteractiveAction::History => run_history(
-                HistoryArgs {
-                    limit: 20,
-                    format: OutputFormat::Human,
-                },
-                database_path.clone(),
-                theme,
-            )?,
+            InteractiveAction::History => browse_history(&database_path, theme)?,
             InteractiveAction::Quit => return Ok(()),
-        }
-
-        if !wait_for_menu(theme)? {
-            return Ok(());
         }
     }
 }
@@ -556,59 +562,13 @@ fn main_menu_lines(selected: usize, theme: Theme, layout: TerminalLayout) -> Vec
     lines
 }
 
-fn wait_for_menu(theme: Theme) -> io::Result<bool> {
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
-    write_ui_line(
-        &mut writer,
-        theme,
-        format!("  {}", theme.muted("enter return to menu    q quit")),
-    )?;
-    writer.flush()?;
-    let _raw_mode = RawModeGuard::enter(&mut writer)?;
-
-    let return_to_menu = loop {
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            continue;
-        }
-        if matches!(
-            key,
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "application closed",
-            ));
-        }
-        match key.code {
-            KeyCode::Char('q') => break false,
-            KeyCode::Enter | KeyCode::Esc => break true,
-            _ => {}
-        }
-    };
-
-    execute!(
-        writer,
-        cursor::Show,
-        terminal::Clear(ClearType::All),
-        cursor::MoveTo(0, 0)
-    )?;
-    Ok(return_to_menu)
-}
-
 fn run_scan(
     args: ScanArgs,
     database_path: Option<PathBuf>,
     cancellation: &CancellationToken,
     theme: Theme,
-) -> Result<(), Box<dyn Error>> {
+    render_report: bool,
+) -> Result<Option<i64>, Box<dyn Error>> {
     let history_database_path = if args.no_history {
         None
     } else {
@@ -735,7 +695,8 @@ fn run_scan(
         })
         .transpose()?;
 
-    match args.format {
+    if render_report {
+        match args.format {
         OutputFormat::Human => print_human(
             &result,
             &findings,
@@ -748,7 +709,7 @@ fn run_scan(
             history_scan_id,
             theme,
         ),
-        OutputFormat::Json => println!(
+            OutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&JsonOutput {
                 scan: result,
@@ -759,9 +720,10 @@ fn run_scan(
                 policy,
                 history_scan_id,
             })?
-        ),
+            ),
+        }
     }
-    Ok(())
+    Ok(history_scan_id)
 }
 
 fn run_history(
@@ -778,6 +740,902 @@ fn run_history(
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&history)?),
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewSection {
+    Overview,
+    Recommendations,
+    Duplicates,
+    Relationships,
+    Warnings,
+}
+
+impl ReviewSection {
+    const ALL: [Self; 5] = [
+        Self::Overview,
+        Self::Recommendations,
+        Self::Duplicates,
+        Self::Relationships,
+        Self::Warnings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Recommendations => "review",
+            Self::Duplicates => "duplicates",
+            Self::Relationships => "related",
+            Self::Warnings => "warnings",
+        }
+    }
+}
+
+fn browse_history(database_path: &Path, theme: Theme) -> Result<(), Box<dyn Error>> {
+    let database = Database::open(database_path)?;
+    let history = database.scan_history(100)?;
+    let mut selected = 0_usize;
+
+    loop {
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        let chosen = {
+            let _raw_mode = RawModeGuard::enter(&mut writer)?;
+            loop {
+                render_history_browser(&mut writer, &history, selected, database_path, theme)?;
+                let Event::Key(key) = event::read()? else {
+                    continue;
+                };
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    continue;
+                }
+                if is_control_c(key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "application closed",
+                    )
+                    .into());
+                }
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') if !history.is_empty() => {
+                        selected = selected.checked_sub(1).unwrap_or(history.len() - 1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !history.is_empty() => {
+                        selected = (selected + 1) % history.len();
+                    }
+                    KeyCode::Home if !history.is_empty() => selected = 0,
+                    KeyCode::End if !history.is_empty() => selected = history.len() - 1,
+                    KeyCode::Enter if !history.is_empty() => break Some(history[selected].id),
+                    KeyCode::Esc | KeyCode::Char('q') => break None,
+                    _ => {}
+                }
+            }
+        };
+        execute!(
+            writer,
+            cursor::Show,
+            terminal::Clear(ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
+        drop(writer);
+
+        let Some(scan_id) = chosen else {
+            return Ok(());
+        };
+        if let Some(analysis) = database.analysis(scan_id)? {
+            review_analysis(&analysis, theme)?;
+        }
+    }
+}
+
+fn render_history_browser<W: Write>(
+    writer: &mut W,
+    history: &[ScanHistoryEntry],
+    selected: usize,
+    database_path: &Path,
+    theme: Theme,
+) -> io::Result<()> {
+    let layout = terminal_layout(theme);
+    let lines = history_browser_lines(history, selected, database_path, theme, layout);
+    execute!(writer, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+    for (row, line) in lines.iter().take(layout.rows).enumerate() {
+        execute!(
+            writer,
+            cursor::MoveTo(layout.margin as u16, row as u16),
+            crossterm::style::Print(line)
+        )?;
+    }
+    writer.flush()
+}
+
+fn history_browser_lines(
+    history: &[ScanHistoryEntry],
+    selected: usize,
+    database_path: &Path,
+    theme: Theme,
+    layout: TerminalLayout,
+) -> Vec<String> {
+    let mut lines = brand_header_lines_for_width(theme, "HISTORY", layout.width).to_vec();
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.text(truncate_end(
+            "Open a previous scan and continue reviewing its results",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.muted(truncate_start(
+            &database_path.display().to_string(),
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+
+    if history.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("  {}", theme.text("No scans have been saved yet.")));
+        lines.push(format!(
+            "  {}",
+            theme.muted("Return home and run a storage scan first.")
+        ));
+    } else {
+        let visible = layout.rows.saturating_sub(13).clamp(3, 12);
+        let start = visible_window_start(selected, history.len(), visible);
+        for (index, entry) in history.iter().enumerate().skip(start).take(visible) {
+            let marker = if index == selected { "›" } else { " " };
+            let row = if layout.width >= 58 {
+                let path_width = layout.width.saturating_sub(36);
+                format!(
+                    " {marker} #{:<4} {:>9}  {:>3} items  {} ",
+                    entry.id,
+                    format_bytes(entry.total_size_bytes),
+                    entry.recommendation_count,
+                    truncate_start(&entry.root.display().to_string(), path_width)
+                )
+            } else {
+                let path_width = layout.width.saturating_sub(20);
+                format!(
+                    " {marker} #{:<3} {:>9}  {} ",
+                    entry.id,
+                    format_bytes(entry.total_size_bytes),
+                    truncate_start(&entry.root.display().to_string(), path_width)
+                )
+            };
+            lines.push(format!(
+                "  {}",
+                if index == selected {
+                    theme.selected(row)
+                } else {
+                    theme.text(row)
+                }
+            ));
+        }
+        let entry = &history[selected];
+        lines.push(String::new());
+        let summary = format!(
+            "{} recommendations • {} duplicate groups • {} relationships",
+            entry.recommendation_count,
+            entry.duplicate_group_count,
+            entry.relationship_count
+        );
+        for (index, part) in wrap_text(&summary, layout.width.saturating_sub(14))
+            .iter()
+            .enumerate()
+        {
+            let prefix = if index == 0 { "selected" } else { "" };
+            lines.push(format!(
+                "  {}  {}",
+                theme.accent(format!("{prefix:<8}")),
+                theme.text(part)
+            ));
+        }
+        lines.push(format!(
+            "  {}",
+            theme.muted(format!("completed {}", format_age(entry.completed_at_epoch_seconds)))
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.muted(truncate_end(
+            "↑/↓  j/k move    enter open scan    q back",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines
+}
+
+fn review_analysis(analysis: &StoredAnalysis, theme: Theme) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let mut section = ReviewSection::Recommendations;
+    let mut selected = [0_usize; 5];
+    let _raw_mode = RawModeGuard::enter(&mut writer)?;
+
+    loop {
+        render_review(&mut writer, analysis, section, selected[section_index(section)], theme)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        if is_control_c(key) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "application closed"));
+        }
+        let section_position = section_index(section);
+        let item_count = review_item_count(analysis, section);
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                section = ReviewSection::ALL
+                    [(section_position + ReviewSection::ALL.len() - 1) % ReviewSection::ALL.len()];
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                section = ReviewSection::ALL[(section_position + 1) % ReviewSection::ALL.len()];
+            }
+            KeyCode::BackTab => {
+                section = ReviewSection::ALL
+                    [(section_position + ReviewSection::ALL.len() - 1) % ReviewSection::ALL.len()];
+            }
+            KeyCode::Up | KeyCode::Char('k') if item_count > 0 => {
+                selected[section_position] = selected[section_position]
+                    .checked_sub(1)
+                    .unwrap_or(item_count - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if item_count > 0 => {
+                selected[section_position] = (selected[section_position] + 1) % item_count;
+            }
+            KeyCode::Home if item_count > 0 => selected[section_position] = 0,
+            KeyCode::End if item_count > 0 => selected[section_position] = item_count - 1,
+            KeyCode::Char(character @ '1'..='5') => {
+                section = ReviewSection::ALL[(character as usize) - ('1' as usize)];
+            }
+            KeyCode::Esc | KeyCode::Char('q') => break,
+            _ => {}
+        }
+    }
+
+    execute!(
+        writer,
+        cursor::Show,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    Ok(())
+}
+
+fn render_review<W: Write>(
+    writer: &mut W,
+    analysis: &StoredAnalysis,
+    section: ReviewSection,
+    selected: usize,
+    theme: Theme,
+) -> io::Result<()> {
+    let layout = terminal_layout(theme);
+    let lines = review_lines(analysis, section, selected, theme, layout);
+    execute!(writer, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+    for (row, line) in lines.iter().take(layout.rows).enumerate() {
+        execute!(
+            writer,
+            cursor::MoveTo(layout.margin as u16, row as u16),
+            crossterm::style::Print(line)
+        )?;
+    }
+    writer.flush()
+}
+
+fn review_lines(
+    analysis: &StoredAnalysis,
+    section: ReviewSection,
+    selected: usize,
+    theme: Theme,
+    layout: TerminalLayout,
+) -> Vec<String> {
+    let summary = &analysis.summary;
+    let mut lines = brand_header_lines_for_width(theme, "REVIEW", layout.width).to_vec();
+    lines.push(format!(
+        "  {}  {}",
+        theme.accent(format!("scan #{}", summary.id)),
+        theme.muted(truncate_start(
+            &summary.root.display().to_string(),
+            layout.width.saturating_sub(16)
+        ))
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.text(truncate_end(
+            &format!(
+                "{} analyzed • {} recommendations • nothing changed",
+                format_bytes(summary.total_size_bytes),
+                summary.recommendation_count
+            ),
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines.push(String::new());
+    lines.push(review_tab_line(section, theme, layout.width));
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+
+    match section {
+        ReviewSection::Overview => {
+            push_review_overview(&mut lines, analysis, theme, layout.width)
+        }
+        ReviewSection::Recommendations => {
+            push_review_recommendations(&mut lines, analysis, selected, theme, layout)
+        }
+        ReviewSection::Duplicates => {
+            push_review_duplicates(&mut lines, analysis, selected, theme, layout)
+        }
+        ReviewSection::Relationships => {
+            push_review_relationships(&mut lines, analysis, selected, theme, layout)
+        }
+        ReviewSection::Warnings => {
+            push_review_warnings(&mut lines, analysis, selected, theme, layout)
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.muted(truncate_end(
+            "←/→  h/l section    ↑/↓  j/k item    1–5 jump    q back",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines
+}
+
+fn review_tab_line(section: ReviewSection, theme: Theme, width: usize) -> String {
+    let mut tabs = String::from("  ");
+    let compact = width < 66;
+    let minimal = width < 50;
+    for (index, candidate) in ReviewSection::ALL.iter().enumerate() {
+        let label = if minimal {
+            format!(" {}{} ", index + 1, review_minimal_label(*candidate))
+        } else if compact {
+            format!(" {} {} ", index + 1, review_compact_label(*candidate))
+        } else {
+            format!(" {} {} ", index + 1, candidate.label())
+        };
+        if *candidate == section {
+            tabs.push_str(&theme.selected(label));
+        } else {
+            tabs.push_str(&theme.muted(label));
+        }
+        tabs.push(' ');
+    }
+    tabs
+}
+
+fn review_minimal_label(section: ReviewSection) -> char {
+    match section {
+        ReviewSection::Overview => 'i',
+        ReviewSection::Recommendations => 'r',
+        ReviewSection::Duplicates => 'd',
+        ReviewSection::Relationships => 'l',
+        ReviewSection::Warnings => 'w',
+    }
+}
+
+fn review_compact_label(section: ReviewSection) -> &'static str {
+    match section {
+        ReviewSection::Overview => "info",
+        ReviewSection::Recommendations => "review",
+        ReviewSection::Duplicates => "dupes",
+        ReviewSection::Relationships => "links",
+        ReviewSection::Warnings => "warn",
+    }
+}
+
+fn push_review_overview(
+    lines: &mut Vec<String>,
+    analysis: &StoredAnalysis,
+    theme: Theme,
+    width: usize,
+) {
+    let summary = &analysis.summary;
+    lines.push(format!("  {}", theme.text("What this scan found")));
+    lines.push(String::new());
+    lines.push(review_metric(
+        "space analyzed",
+        &format_bytes(summary.total_size_bytes),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "contents",
+        &format!("{} files • {} folders", summary.file_count, summary.directory_count),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "review queue",
+        &format!("{} recommendations", analysis.findings.len()),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "duplicates",
+        &format!("{} exact groups", analysis.duplicate_groups.len()),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "relationships",
+        &format!("{} connections", analysis.relationships.len()),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "local AI",
+        &format!("{} saved explanations", analysis.ai_explanations.len()),
+        theme,
+        width,
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "  {} {}",
+        theme.green("✓"),
+        theme.text(truncate_end(
+            "This scan only observed metadata. It did not change any files.",
+            width.saturating_sub(4)
+        ))
+    ));
+}
+
+fn push_review_recommendations(
+    lines: &mut Vec<String>,
+    analysis: &StoredAnalysis,
+    selected: usize,
+    theme: Theme,
+    layout: TerminalLayout,
+) {
+    if analysis.findings.is_empty() {
+        lines.push(format!(
+            "  {} {}",
+            theme.green("✓"),
+            theme.text(truncate_end(
+                "No cleanup candidates were found.",
+                layout.width.saturating_sub(6)
+            ))
+        ));
+        return;
+    }
+    lines.push(format!(
+        "  {}",
+        theme.text(truncate_end(
+            "Safest and clearest candidates appear first — size is not the only factor",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    let visible = review_list_height(layout);
+    let start = visible_window_start(selected, analysis.findings.len(), visible);
+    for (index, finding) in analysis.findings.iter().enumerate().skip(start).take(visible) {
+        let marker = if index == selected { "›" } else { " " };
+        let row = if layout.width >= 60 {
+            let path_width = layout.width.saturating_sub(48);
+            format!(
+                " {marker} {:>9}  {:<6} {:<19} {} ",
+                format_bytes(finding.potential_recovery_bytes),
+                risk_label(finding.risk),
+                truncate_end(category_label(finding.category), 19),
+                truncate_start(
+                    &display_relative(&analysis.summary.root, &finding.path),
+                    path_width
+                )
+            )
+        } else {
+            let path_width = layout.width.saturating_sub(24);
+            format!(
+                " {marker} {:>9} {:<6} {} ",
+                format_bytes(finding.potential_recovery_bytes),
+                risk_label(finding.risk),
+                truncate_start(
+                    &display_relative(&analysis.summary.root, &finding.path),
+                    path_width
+                )
+            )
+        };
+        lines.push(format!(
+            "  {}",
+            if index == selected {
+                theme.selected(row)
+            } else {
+                theme.text(row)
+            }
+        ));
+    }
+    push_recommendation_detail(lines, analysis, selected, theme, layout.width);
+}
+
+fn push_recommendation_detail(
+    lines: &mut Vec<String>,
+    analysis: &StoredAnalysis,
+    selected: usize,
+    theme: Theme,
+    width: usize,
+) {
+    let finding = &analysis.findings[selected];
+    lines.push(String::new());
+    if width >= 48 {
+        lines.push(format!(
+            "  {}  {}",
+            theme.accent("WHY REVIEW THIS"),
+            theme.muted("deterministic evidence")
+        ));
+    } else {
+        lines.push(format!("  {}", theme.accent("WHY REVIEW THIS")));
+    }
+    lines.push(review_metric(
+        "item",
+        &display_relative(&analysis.summary.root, &finding.path),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "potential space",
+        &format_bytes(finding.potential_recovery_bytes),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "risk / confidence",
+        &format!("{} / {:.0}%", risk_label(finding.risk), finding.confidence * 100.0),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "next step",
+        action_label(finding.suggested_action),
+        theme,
+        width,
+    ));
+    lines.push(review_metric(
+        "guidance",
+        recommendation_guidance(finding.risk, finding.suggested_action),
+        theme,
+        width,
+    ));
+    for evidence in &finding.evidence {
+        push_review_bullet(lines, &humanize_evidence(evidence), theme, width);
+    }
+    if let Some(explanation) = analysis
+        .ai_explanations
+        .iter()
+        .find(|explanation| explanation.path == finding.path)
+    {
+        if width >= 58 {
+            lines.push(format!(
+                "  {}  {}",
+                theme.accent("LOCAL AI"),
+                theme.muted("context only • never deletion permission")
+            ));
+        } else {
+            lines.push(format!("  {}", theme.accent("LOCAL AI • ADVISORY")));
+        }
+        push_review_bullet(lines, &explanation.reason, theme, width);
+    }
+}
+
+fn push_review_duplicates(
+    lines: &mut Vec<String>,
+    analysis: &StoredAnalysis,
+    selected: usize,
+    theme: Theme,
+    layout: TerminalLayout,
+) {
+    if analysis.duplicate_groups.is_empty() {
+        lines.push(format!(
+            "  {} {}",
+            theme.green("✓"),
+            theme.text(truncate_end(
+                "No exact duplicate groups were found.",
+                layout.width.saturating_sub(6)
+            ))
+        ));
+        return;
+    }
+    lines.push(format!(
+        "  {}",
+        theme.text(truncate_end(
+            "Exact byte-for-byte matches; keep at least one physical copy",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    let visible = review_list_height(layout);
+    let start = visible_window_start(selected, analysis.duplicate_groups.len(), visible);
+    for (index, group) in analysis
+        .duplicate_groups
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
+        let marker = if index == selected { "›" } else { " " };
+        let recovery = group
+            .potential_recovery_allocated_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "unknown".to_owned());
+        let row = if layout.width >= 56 {
+            format!(
+                " {marker} {:>9} recoverable  {:>3} copies  {}… ",
+                recovery,
+                group.unique_file_count,
+                &group.blake3_hash[..12.min(group.blake3_hash.len())]
+            )
+        } else {
+            format!(
+                " {marker} {:>9}  {:>3} copies ",
+                recovery, group.unique_file_count
+            )
+        };
+        lines.push(format!(
+            "  {}",
+            if index == selected {
+                theme.selected(row)
+            } else {
+                theme.text(row)
+            }
+        ));
+    }
+    let group = &analysis.duplicate_groups[selected];
+    lines.push(String::new());
+    lines.push(format!("  {}", theme.accent("FILES IN THIS GROUP")));
+    for entry in group.entries.iter().take(6) {
+        let suffix = if entry.protected { "  [protected]" } else { "" };
+        push_review_bullet(
+            lines,
+            &format!(
+                "{}{}",
+                display_relative(&analysis.summary.root, &entry.path),
+                suffix
+            ),
+            theme,
+            layout.width,
+        );
+    }
+}
+
+fn push_review_relationships(
+    lines: &mut Vec<String>,
+    analysis: &StoredAnalysis,
+    selected: usize,
+    theme: Theme,
+    layout: TerminalLayout,
+) {
+    if analysis.relationships.is_empty() {
+        lines.push(format!(
+            "  {} {}",
+            theme.green("✓"),
+            theme.text(truncate_end(
+                "No related items were detected.",
+                layout.width.saturating_sub(6)
+            ))
+        ));
+        return;
+    }
+    lines.push(format!(
+        "  {}",
+        theme.text(truncate_end(
+            "Connections are evidence, never permission to delete",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    let visible = review_list_height(layout);
+    let start = visible_window_start(selected, analysis.relationships.len(), visible);
+    for (index, relationship) in analysis
+        .relationships
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
+        let marker = if index == selected { "›" } else { " " };
+        let label_width = if layout.width >= 60 { 24 } else { 12 };
+        let path_width = layout.width.saturating_sub(label_width + 8);
+        let row = format!(
+            " {marker} {:<label_width$} {} ",
+            truncate_end(relationship_kind_label(relationship.kind), label_width),
+            truncate_start(
+                &display_relative(&analysis.summary.root, &relationship.source_path),
+                path_width
+            )
+        );
+        lines.push(format!(
+            "  {}",
+            if index == selected {
+                theme.selected(row)
+            } else {
+                theme.text(row)
+            }
+        ));
+    }
+    let relationship = &analysis.relationships[selected];
+    lines.push(String::new());
+    lines.push(format!("  {}", theme.accent("CONNECTED ITEMS")));
+    lines.push(review_metric(
+        "source",
+        &display_relative(&analysis.summary.root, &relationship.source_path),
+        theme,
+        layout.width,
+    ));
+    lines.push(review_metric(
+        "related",
+        &display_relative(&analysis.summary.root, &relationship.target_path),
+        theme,
+        layout.width,
+    ));
+    lines.push(review_metric(
+        "confidence",
+        &format!("{:.0}%", relationship.confidence * 100.0),
+        theme,
+        layout.width,
+    ));
+    for evidence in &relationship.evidence {
+        push_review_bullet(lines, evidence, theme, layout.width);
+    }
+}
+
+fn push_review_warnings(
+    lines: &mut Vec<String>,
+    analysis: &StoredAnalysis,
+    selected: usize,
+    theme: Theme,
+    layout: TerminalLayout,
+) {
+    let warning_count = analysis.summary.warning_count;
+    if warning_count == 0 {
+        lines.push(format!(
+            "  {} {}",
+            theme.green("✓"),
+            theme.text(truncate_end(
+                "The scan completed without skipped or changing files.",
+                layout.width.saturating_sub(6)
+            ))
+        ));
+    } else if !analysis.warnings.is_empty() {
+        lines.push(format!(
+            "  {}",
+            theme.text(truncate_end(
+                "Skipped or changing items; the rest of the scan remains usable",
+                layout.width.saturating_sub(2)
+            ))
+        ));
+        let visible = review_list_height(layout);
+        let start = visible_window_start(selected, analysis.warnings.len(), visible);
+        for (index, warning) in analysis.warnings.iter().enumerate().skip(start).take(visible) {
+            let marker = if index == selected { "›" } else { " " };
+            let location = warning
+                .path
+                .as_deref()
+                .map(|path| display_relative(&analysis.summary.root, path))
+                .unwrap_or_else(|| "scan".to_owned());
+            let path_width = layout.width.saturating_sub(18);
+            let row = format!(
+                " {marker} {:<10} {} ",
+                truncate_end(&warning.source, 10),
+                truncate_start(&location, path_width)
+            );
+            lines.push(format!(
+                "  {}",
+                if index == selected {
+                    theme.selected(row)
+                } else {
+                    theme.text(row)
+                }
+            ));
+        }
+        let warning = &analysis.warnings[selected];
+        lines.push(String::new());
+        lines.push(format!("  {}", theme.accent("WHAT HAPPENED")));
+        push_review_bullet(lines, &warning.message, theme, layout.width);
+        if let Some(kind) = &warning.kind {
+            lines.push(review_metric(
+                "warning type",
+                &kind.replace('_', " "),
+                theme,
+                layout.width,
+            ));
+        }
+    } else {
+        push_review_bullet(
+            lines,
+            &format!("{warning_count} items were skipped or changed while scanning."),
+            theme,
+            layout.width,
+        );
+        lines.push(String::new());
+        push_review_bullet(
+            lines,
+            "History stores the warning count, not each warning message.",
+            theme,
+            layout.width,
+        );
+        push_review_bullet(
+            lines,
+            "Run the scan again to inspect current filesystem results.",
+            theme,
+            layout.width,
+        );
+    }
+}
+
+fn review_metric(label: &str, value: &str, theme: Theme, width: usize) -> String {
+    let value_width = width.saturating_sub(22).max(1);
+    format!(
+        "  {}  {}",
+        theme.muted(format!("{label:<18}")),
+        theme.text(truncate_start(value, value_width))
+    )
+}
+
+fn push_review_bullet(lines: &mut Vec<String>, value: &str, theme: Theme, width: usize) {
+    let content_width = width.saturating_sub(8).max(1);
+    for (index, part) in wrap_text(value, content_width).iter().enumerate() {
+        let marker = if index == 0 { "•" } else { " " };
+        lines.push(format!(
+            "    {} {}",
+            theme.accent(marker),
+            theme.muted(part)
+        ));
+    }
+}
+
+fn review_list_height(layout: TerminalLayout) -> usize {
+    layout.rows.saturating_sub(24).clamp(1, 7)
+}
+
+fn visible_window_start(selected: usize, total: usize, visible: usize) -> usize {
+    if total <= visible || selected < visible {
+        0
+    } else {
+        (selected + 1 - visible).min(total.saturating_sub(visible))
+    }
+}
+
+fn review_item_count(analysis: &StoredAnalysis, section: ReviewSection) -> usize {
+    match section {
+        ReviewSection::Overview => 0,
+        ReviewSection::Recommendations => analysis.findings.len(),
+        ReviewSection::Duplicates => analysis.duplicate_groups.len(),
+        ReviewSection::Relationships => analysis.relationships.len(),
+        ReviewSection::Warnings => analysis.warnings.len(),
+    }
+}
+
+fn section_index(section: ReviewSection) -> usize {
+    ReviewSection::ALL
+        .iter()
+        .position(|candidate| *candidate == section)
+        .expect("review section belongs to the static section list")
+}
+
+fn is_control_c(key: KeyEvent) -> bool {
+    matches!(
+        key,
+        KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }
+    )
 }
 
 fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
@@ -2467,6 +3325,19 @@ fn action_label(action: SuggestedAction) -> &'static str {
     }
 }
 
+fn recommendation_guidance(risk: RiskLevel, action: SuggestedAction) -> &'static str {
+    match (risk, action) {
+        (RiskLevel::Low, SuggestedAction::ReviewForDeletion) => {
+            "Good cleanup candidate; verify it before deleting"
+        }
+        (RiskLevel::Low, SuggestedAction::ReviewForArchive) => {
+            "Low detected risk; consider archiving it first"
+        }
+        (RiskLevel::Medium, _) => "Inspect its project or application context first",
+        (RiskLevel::High, _) => "Do not delete until you understand and back up this item",
+    }
+}
+
 fn ai_action_label(action: AiSuggestedAction) -> &'static str {
     match action {
         AiSuggestedAction::ReviewForDeletion => "review for deletion",
@@ -2555,6 +3426,53 @@ fn parse_size(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_stored_analysis() -> StoredAnalysis {
+        let root = PathBuf::from("/home/example/Downloads");
+        let path = root.join("large-archive.zip");
+        StoredAnalysis {
+            summary: ScanHistoryEntry {
+                id: 7,
+                root: root.clone(),
+                started_at_epoch_seconds: 100,
+                completed_at_epoch_seconds: 200,
+                total_size_bytes: 4 * 1024 * 1024 * 1024,
+                total_allocated_size_bytes: Some(4 * 1024 * 1024 * 1024),
+                file_count: 12,
+                directory_count: 4,
+                recommendation_count: 1,
+                duplicate_group_count: 0,
+                relationship_count: 0,
+                warning_count: 0,
+                duplicate_recovery_bytes: Some(0),
+                recovered_space_bytes: 0,
+                ai_status: "complete".to_owned(),
+                ai_model: Some("qwen3:4b".to_owned()),
+                ai_candidate_count: 1,
+                ai_explanation_count: 1,
+            },
+            findings: vec![Finding {
+                category: FindingCategory::OldArchive,
+                path: path.clone(),
+                potential_recovery_bytes: 2 * 1024 * 1024 * 1024,
+                confidence: 0.92,
+                risk: RiskLevel::Low,
+                evidence: vec!["Archive has not changed in 220 days".to_owned()],
+                suggested_action: SuggestedAction::ReviewForDeletion,
+            }],
+            duplicate_groups: Vec::new(),
+            relationships: Vec::new(),
+            ai_explanations: vec![spacemind_core::AiExplanation {
+                path,
+                category: spacemind_core::AiCategory::ArchiveWithExtractedCopy,
+                risk: RiskLevel::Low,
+                confidence: 0.88,
+                reason: "This looks replaceable, but verify the extracted folder first.".to_owned(),
+                suggested_action: AiSuggestedAction::ReviewForDeletion,
+            }],
+            warnings: Vec::new(),
+        }
+    }
 
     #[test]
     fn parses_decimal_and_binary_sizes() {
@@ -2649,6 +3567,56 @@ mod tests {
         assert!(lines.iter().all(|line| display_width(line) <= layout.width));
         assert!(lines.iter().any(|line| line.contains("›  02")));
         assert!(lines.iter().any(|line| line.contains("Scan history")));
+    }
+
+    #[test]
+    fn history_browser_makes_saved_scans_selectable() {
+        let analysis = sample_stored_analysis();
+        let layout = TerminalLayout::for_size(48, 24);
+        let lines = history_browser_lines(
+            &[analysis.summary],
+            0,
+            Path::new("/tmp/spacemind.db"),
+            Theme::plain(),
+            layout,
+        );
+
+        assert!(lines.iter().all(|line| display_width(line) <= layout.width));
+        assert!(lines.iter().any(|line| line.contains("enter open scan")));
+        assert!(lines.iter().any(|line| line.contains("› #7")));
+    }
+
+    #[test]
+    fn review_screen_prioritizes_a_clear_recommendation_detail() {
+        let analysis = sample_stored_analysis();
+        let layout = TerminalLayout::for_size(86, 30);
+        let lines = review_lines(
+            &analysis,
+            ReviewSection::Recommendations,
+            0,
+            Theme::plain(),
+            layout,
+        );
+        let output = lines.join("\n");
+
+        assert!(output.contains("WHY REVIEW THIS"));
+        assert!(output.contains("potential space"));
+        assert!(output.contains("LOCAL AI"));
+        assert!(output.contains("never deletion permission"));
+    }
+
+    #[test]
+    fn every_review_section_fits_a_narrow_terminal() {
+        let analysis = sample_stored_analysis();
+        let layout = TerminalLayout::for_size(32, 24);
+
+        for section in ReviewSection::ALL {
+            let lines = review_lines(&analysis, section, 0, Theme::plain(), layout);
+            assert!(
+                lines.iter().all(|line| display_width(line) <= layout.width),
+                "{section:?} contained an overflowing line: {lines:?}"
+            );
+        }
     }
 
     #[test]
