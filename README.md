@@ -18,9 +18,21 @@ After that, start it from any directory with:
 spacemind
 ```
 
-SpaceMind opens a centered home menu where you can scan storage, review scan history, or
-quit. Use the arrow keys or `j`/`k` to move and `Enter` to select. The scan flow then lets
-you choose the current folder, Home, Downloads, Documents, Desktop, or a custom path.
+SpaceMind opens a centered home menu where you can scan storage, open scan history, or quit.
+Use the arrow keys or `j`/`k` to move and `Enter` to select. The scan flow then lets you
+choose the current folder, Home, Downloads, Documents, Desktop, or a custom path. After a
+scan finishes, SpaceMind opens its interactive review instead of printing a long report.
+
+The review is organized into five views:
+
+- **Overview** summarizes the scan and confirms that nothing was changed.
+- **Review** puts the cleanup candidates first and explains one selected item at a time.
+- **Duplicates** shows exact copies and the files belonging to each group.
+- **Related** shows evidence connecting archives, projects, virtual machines, and other items.
+- **Warnings** shows paths that could not be read or changed during analysis.
+
+Use `h`/`l` or the left/right arrows to change views, `j`/`k` or the up/down arrows to move
+between items, and `q` to go back. The numbered keys `1` through `5` jump directly to a view.
 
 You can also skip the selector and provide a folder directly:
 
@@ -83,7 +95,8 @@ ANSI color codes.
 
 Successful scans are saved automatically to a local SQLite database. SpaceMind stores
 filesystem metadata and analysis results, never file contents. Choose **Scan history**
-from the home menu. The equivalent command for scripts is:
+from the home menu, select a scan, and press `Enter` to reopen its complete review. The
+equivalent non-interactive command for scripts is:
 
 ```bash
 spacemind history
