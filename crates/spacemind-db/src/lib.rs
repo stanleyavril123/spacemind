@@ -1,8 +1,9 @@
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use spacemind_core::{
-    AiReport, AiStatus, CancellationToken, DuplicateReport, Finding, RelationshipReport,
-    ScanResult, ScannedItem,
+    AiExplanation, AiReport, AiStatus, CancellationToken, DuplicateEntry, DuplicateGroup,
+    DuplicateReport, FileIdentity, Finding, Relationship, RelationshipReport, ScanResult,
+    ScannedItem,
 };
 use std::env;
 use std::ffi::OsString;
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = r#"
 BEGIN IMMEDIATE;
@@ -170,6 +171,24 @@ PRAGMA user_version = 2;
 COMMIT;
 "#;
 
+const SCHEMA_V3: &str = r#"
+BEGIN IMMEDIATE;
+
+CREATE TABLE analysis_warnings (
+    id INTEGER PRIMARY KEY,
+    scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    path BLOB,
+    kind TEXT,
+    message TEXT NOT NULL
+);
+
+CREATE INDEX analysis_warnings_scan_idx ON analysis_warnings(scan_id);
+
+PRAGMA user_version = 3;
+COMMIT;
+"#;
+
 #[derive(Debug, Error)]
 pub enum DatabaseError {
     #[error("cannot create database directory {path}: {source}")]
@@ -229,6 +248,24 @@ pub struct ScanHistoryEntry {
     pub ai_explanation_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredAnalysis {
+    pub summary: ScanHistoryEntry,
+    pub findings: Vec<Finding>,
+    pub duplicate_groups: Vec<DuplicateGroup>,
+    pub relationships: Vec<Relationship>,
+    pub ai_explanations: Vec<AiExplanation>,
+    pub warnings: Vec<StoredWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWarning {
+    pub source: String,
+    pub path: Option<PathBuf>,
+    pub kind: Option<String>,
+    pub message: String,
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -262,8 +299,13 @@ impl Database {
             0 => {
                 self.connection.execute_batch(SCHEMA_V1)?;
                 self.connection.execute_batch(SCHEMA_V2)?;
+                self.connection.execute_batch(SCHEMA_V3)?;
             }
-            1 => self.connection.execute_batch(SCHEMA_V2)?,
+            1 => {
+                self.connection.execute_batch(SCHEMA_V2)?;
+                self.connection.execute_batch(SCHEMA_V3)?;
+            }
+            2 => self.connection.execute_batch(SCHEMA_V3)?,
             SCHEMA_VERSION => {}
             found => {
                 return Err(DatabaseError::UnsupportedSchemaVersion {
@@ -303,6 +345,7 @@ impl Database {
             cancellation,
         )?;
         insert_ai_explanations(&transaction, scan_id, analysis.ai, cancellation)?;
+        insert_warnings(&transaction, scan_id, analysis, cancellation)?;
         insert_ignored_paths(&transaction, scan_id, analysis.scan, cancellation)?;
         check_cancelled(cancellation)?;
         transaction.commit()?;
@@ -343,6 +386,179 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn analysis(&self, scan_id: i64) -> Result<Option<StoredAnalysis>> {
+        let Some(summary) = self.scan(scan_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(StoredAnalysis {
+            summary,
+            findings: self.findings(scan_id)?,
+            duplicate_groups: self.duplicate_groups(scan_id)?,
+            relationships: self.relationships(scan_id)?,
+            ai_explanations: self.ai_explanations(scan_id)?,
+            warnings: self.warnings(scan_id)?,
+        }))
+    }
+
+    fn findings(&self, scan_id: i64) -> Result<Vec<Finding>> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, category, potential_recovery_bytes, confidence, risk, \
+             evidence_json, suggested_action FROM recommendations \
+             WHERE scan_id = ?1 ORDER BY potential_recovery_bytes DESC, path",
+        )?;
+        let mut rows = statement.query([scan_id])?;
+        let mut findings = Vec::new();
+        while let Some(row) = rows.next()? {
+            findings.push(Finding {
+                path: stored_path(row.get(0)?)?,
+                category: deserialized_name(&row.get::<_, String>(1)?)?,
+                potential_recovery_bytes: stored_integer(
+                    row.get(2)?,
+                    "finding.potential_recovery_bytes",
+                )?,
+                confidence: row.get::<_, f64>(3)? as f32,
+                risk: deserialized_name(&row.get::<_, String>(4)?)?,
+                evidence: serde_json::from_str(&row.get::<_, String>(5)?)?,
+                suggested_action: deserialized_name(&row.get::<_, String>(6)?)?,
+            });
+        }
+        findings.sort_by(|left, right| {
+            stored_action_rank(left.suggested_action)
+                .cmp(&stored_action_rank(right.suggested_action))
+                .then_with(|| stored_risk_rank(left.risk).cmp(&stored_risk_rank(right.risk)))
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| {
+                    right
+                        .potential_recovery_bytes
+                        .cmp(&left.potential_recovery_bytes)
+                })
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(findings)
+    }
+
+    fn duplicate_groups(&self, scan_id: i64) -> Result<Vec<DuplicateGroup>> {
+        let mut group_statement = self.connection.prepare(
+            "SELECT id, blake3_hash, size_bytes_per_file, unique_file_count, \
+             protected_file_count, logical_duplicate_bytes, potential_recovery_bytes \
+             FROM duplicate_groups WHERE scan_id = ?1 ORDER BY logical_duplicate_bytes DESC, id",
+        )?;
+        let mut entry_statement = self.connection.prepare(
+            "SELECT path, volume_id, file_id, allocated_size_bytes, hard_link_count, protected \
+             FROM duplicate_entries WHERE group_id = ?1 ORDER BY path",
+        )?;
+        let mut rows = group_statement.query([scan_id])?;
+        let mut groups = Vec::new();
+        while let Some(row) = rows.next()? {
+            let group_id: i64 = row.get(0)?;
+            let mut entry_rows = entry_statement.query([group_id])?;
+            let mut entries = Vec::new();
+            while let Some(entry) = entry_rows.next()? {
+                let volume_id = stored_optional_integer(entry.get(1)?, "duplicate.volume_id")?;
+                let file_id = stored_optional_integer(entry.get(2)?, "duplicate.file_id")?;
+                entries.push(DuplicateEntry {
+                    path: stored_path(entry.get(0)?)?,
+                    file_identity: match (volume_id, file_id) {
+                        (Some(volume_id), Some(file_id)) => Some(FileIdentity {
+                            volume_id,
+                            file_id,
+                        }),
+                        _ => None,
+                    },
+                    allocated_size_bytes: stored_optional_integer(
+                        entry.get(3)?,
+                        "duplicate.allocated_size_bytes",
+                    )?,
+                    hard_link_count: stored_optional_integer(
+                        entry.get(4)?,
+                        "duplicate.hard_link_count",
+                    )?,
+                    protected: entry.get(5)?,
+                });
+            }
+            groups.push(DuplicateGroup {
+                blake3_hash: row.get(1)?,
+                size_bytes_per_file: stored_integer(row.get(2)?, "duplicate.size_bytes_per_file")?,
+                unique_file_count: stored_integer(row.get(3)?, "duplicate.unique_file_count")?,
+                protected_file_count: stored_integer(
+                    row.get(4)?,
+                    "duplicate.protected_file_count",
+                )?,
+                logical_duplicate_bytes: stored_integer(
+                    row.get(5)?,
+                    "duplicate.logical_duplicate_bytes",
+                )?,
+                potential_recovery_allocated_bytes: stored_optional_integer(
+                    row.get(6)?,
+                    "duplicate.potential_recovery_allocated_bytes",
+                )?,
+                entries,
+            });
+        }
+        Ok(groups)
+    }
+
+    fn relationships(&self, scan_id: i64) -> Result<Vec<Relationship>> {
+        let mut statement = self.connection.prepare(
+            "SELECT kind, source_path, target_path, confidence, evidence_json \
+             FROM relationships WHERE scan_id = ?1 ORDER BY kind, source_path, target_path",
+        )?;
+        let mut rows = statement.query([scan_id])?;
+        let mut relationships = Vec::new();
+        while let Some(row) = rows.next()? {
+            relationships.push(Relationship {
+                kind: deserialized_name(&row.get::<_, String>(0)?)?,
+                source_path: stored_path(row.get(1)?)?,
+                target_path: stored_path(row.get(2)?)?,
+                confidence: row.get::<_, f64>(3)? as f32,
+                evidence: serde_json::from_str(&row.get::<_, String>(4)?)?,
+            });
+        }
+        Ok(relationships)
+    }
+
+    fn ai_explanations(&self, scan_id: i64) -> Result<Vec<AiExplanation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, category, risk, confidence, reason, suggested_action \
+             FROM ai_explanations WHERE scan_id = ?1 ORDER BY path",
+        )?;
+        let mut rows = statement.query([scan_id])?;
+        let mut explanations = Vec::new();
+        while let Some(row) = rows.next()? {
+            explanations.push(AiExplanation {
+                path: stored_path(row.get(0)?)?,
+                category: deserialized_name(&row.get::<_, String>(1)?)?,
+                risk: deserialized_name(&row.get::<_, String>(2)?)?,
+                confidence: row.get::<_, f64>(3)? as f32,
+                reason: row.get(4)?,
+                suggested_action: deserialized_name(&row.get::<_, String>(5)?)?,
+            });
+        }
+        Ok(explanations)
+    }
+
+    fn warnings(&self, scan_id: i64) -> Result<Vec<StoredWarning>> {
+        let mut statement = self.connection.prepare(
+            "SELECT source, path, kind, message FROM analysis_warnings \
+             WHERE scan_id = ?1 ORDER BY id",
+        )?;
+        let mut rows = statement.query([scan_id])?;
+        let mut warnings = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path = row
+                .get::<_, Option<Vec<u8>>>(1)?
+                .map(stored_path)
+                .transpose()?;
+            warnings.push(StoredWarning {
+                source: row.get(0)?,
+                path,
+                kind: row.get(2)?,
+                message: row.get(3)?,
+            });
+        }
+        Ok(warnings)
     }
 
     #[cfg(test)]
@@ -621,6 +837,39 @@ fn insert_ai_explanations(
     Ok(())
 }
 
+fn insert_warnings(
+    transaction: &Transaction<'_>,
+    scan_id: i64,
+    analysis: Analysis<'_>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut statement = transaction.prepare_cached(
+        "INSERT INTO analysis_warnings (scan_id, source, path, kind, message) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for warning in &analysis.scan.warnings {
+        check_cancelled(cancellation)?;
+        statement.execute(params![
+            scan_id,
+            "scan",
+            warning.path.as_deref().map(path_bytes),
+            Option::<String>::None,
+            warning.message,
+        ])?;
+    }
+    for warning in &analysis.duplicates.warnings {
+        check_cancelled(cancellation)?;
+        statement.execute(params![
+            scan_id,
+            "duplicate",
+            path_bytes(&warning.path),
+            serialized_name(&warning.kind)?,
+            warning.message,
+        ])?;
+    }
+    Ok(())
+}
+
 fn ai_status_parts(status: &AiStatus) -> (&'static str, Option<&str>, Option<&str>) {
     match status {
         AiStatus::Disabled => ("disabled", None, None),
@@ -711,6 +960,25 @@ fn serialized_name<T: Serialize>(value: &T) -> Result<String> {
     }
 }
 
+fn deserialized_name<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(Into::into)
+}
+
+fn stored_action_rank(action: spacemind_core::SuggestedAction) -> u8 {
+    match action {
+        spacemind_core::SuggestedAction::ReviewForDeletion => 0,
+        spacemind_core::SuggestedAction::ReviewForArchive => 1,
+    }
+}
+
+fn stored_risk_rank(risk: spacemind_core::RiskLevel) -> u8 {
+    match risk {
+        spacemind_core::RiskLevel::Low => 0,
+        spacemind_core::RiskLevel::Medium => 1,
+        spacemind_core::RiskLevel::High => 2,
+    }
+}
+
 fn serialize_path<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -776,7 +1044,8 @@ mod tests {
     use super::*;
     use spacemind_core::{
         AiCategory, AiExplanation, AiSuggestedAction, DuplicateEntry, DuplicateGroup, FileIdentity,
-        FindingCategory, ItemKind, Relationship, RelationshipKind, RiskLevel, SuggestedAction,
+        DuplicateWarning, DuplicateWarningKind, FindingCategory, ItemKind, Relationship,
+        RelationshipKind, RiskLevel, ScanWarning, SuggestedAction,
     };
 
     fn sample_scan() -> ScanResult {
@@ -805,7 +1074,10 @@ mod tests {
                 extension: Some("zip".to_owned()),
             }],
             ignored_paths: vec![PathBuf::from("/home/example/Downloads/node_modules")],
-            warnings: Vec::new(),
+            warnings: vec![ScanWarning {
+                path: Some(PathBuf::from("/home/example/Downloads/unreadable")),
+                message: "Permission denied".to_owned(),
+            }],
         }
     }
 
@@ -838,7 +1110,11 @@ mod tests {
                 logical_duplicate_bytes: 12,
                 potential_recovery_allocated_bytes: Some(16),
             }],
-            warnings: Vec::new(),
+            warnings: vec![DuplicateWarning {
+                path: PathBuf::from("/home/example/Downloads/changing.zip"),
+                kind: DuplicateWarningKind::ChangedDuringDetection,
+                message: "File changed while hashing".to_owned(),
+            }],
             files_hashed: 2,
             bytes_hashed: 24,
             logical_duplicate_bytes: 12,
@@ -904,6 +1180,7 @@ mod tests {
         assert_eq!(database.row_count("duplicate_entries"), 1);
         assert_eq!(database.row_count("relationships"), 1);
         assert_eq!(database.row_count("ai_explanations"), 1);
+        assert_eq!(database.row_count("analysis_warnings"), 2);
         assert_eq!(database.row_count("ignored_paths"), 1);
 
         let history = database.scan_history(10).unwrap();
@@ -913,6 +1190,15 @@ mod tests {
         assert_eq!(history[0].ai_model.as_deref(), Some("qwen3:4b"));
         assert_eq!(history[0].ai_explanation_count, 1);
         assert_eq!(database.scan(id).unwrap(), Some(history[0].clone()));
+        let stored = database.analysis(id).unwrap().unwrap();
+        assert_eq!(stored.summary, history[0]);
+        assert_eq!(stored.findings, findings);
+        assert_eq!(stored.duplicate_groups, duplicates.groups);
+        assert_eq!(stored.relationships, relationships.relationships);
+        assert_eq!(stored.ai_explanations, ai.explanations);
+        assert_eq!(stored.warnings.len(), 2);
+        assert_eq!(stored.warnings[0].source, "scan");
+        assert_eq!(stored.warnings[1].kind.as_deref(), Some("changed_during_detection"));
     }
 
     #[test]
@@ -943,6 +1229,38 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].root, PathBuf::from("/newer"));
         assert!(database.scan_history(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn detailed_review_orders_actionable_low_risk_findings_first() {
+        let mut database = Database::open_in_memory().unwrap();
+        let scan = sample_scan();
+        let mut high_risk = sample_finding();
+        high_risk.path = PathBuf::from("/home/example/Downloads/huge-vm");
+        high_risk.potential_recovery_bytes = 10_000;
+        high_risk.risk = RiskLevel::High;
+        high_risk.suggested_action = SuggestedAction::ReviewForArchive;
+        let mut low_risk = sample_finding();
+        low_risk.path = PathBuf::from("/home/example/Downloads/cache");
+        low_risk.potential_recovery_bytes = 100;
+        low_risk.risk = RiskLevel::Low;
+        low_risk.suggested_action = SuggestedAction::ReviewForDeletion;
+        let duplicates = sample_duplicates();
+        let relationships = sample_relationships();
+        let ai = sample_ai();
+
+        let id = database
+            .save_analysis(Analysis {
+                scan: &scan,
+                findings: &[high_risk, low_risk.clone()],
+                duplicates: &duplicates,
+                relationships: &relationships,
+                ai: &ai,
+            })
+            .unwrap();
+        let stored = database.analysis(id).unwrap().unwrap();
+
+        assert_eq!(stored.findings[0].path, low_risk.path);
     }
 
     #[test]
@@ -998,14 +1316,14 @@ mod tests {
     #[test]
     fn rejects_a_newer_or_unknown_schema() {
         let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch("PRAGMA user_version = 3;").unwrap();
+        connection.execute_batch("PRAGMA user_version = 4;").unwrap();
 
         let error = Database::initialize(connection).unwrap_err();
 
         assert!(matches!(
             error,
             DatabaseError::UnsupportedSchemaVersion {
-                found: 3,
+                found: 4,
                 supported: SCHEMA_VERSION
             }
         ));
@@ -1031,6 +1349,17 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].ai_status, "disabled");
         assert_eq!(history[0].ai_explanation_count, 0);
+    }
+
+    #[test]
+    fn migrates_a_version_two_database_for_detailed_warnings() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection.execute_batch(SCHEMA_V2).unwrap();
+
+        let database = Database::initialize(connection).unwrap();
+
+        assert_eq!(database.row_count("analysis_warnings"), 0);
     }
 
     #[cfg(unix)]
