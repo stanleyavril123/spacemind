@@ -25,14 +25,29 @@ scan finishes, SpaceMind opens its interactive review instead of printing a long
 
 The review is organized into five views:
 
-- **Overview** summarizes the scan and confirms that nothing was changed.
+- **Overview** summarizes the scan, saved decisions, and space moved to Trash.
 - **Review** puts the cleanup candidates first and explains one selected item at a time.
 - **Duplicates** shows exact copies and the files belonging to each group.
 - **Related** shows evidence connecting archives, projects, virtual machines, and other items.
 - **Warnings** shows paths that could not be read or changed during analysis.
 
+When a recognized folder such as `node_modules` already covers its contents, the review shows
+one recommendation for that folder. Its nested files still count toward scan totals and duplicate
+detection; they are not presented as repeated cleanup recommendations.
+
 Use `h`/`l` or the left/right arrows to change views, `j`/`k` or the up/down arrows to move
 between items, and `q` to go back. The numbered keys `1` through `5` jump directly to a view.
+On a selected recommendation, press `o` to open its location, `i` to ignore that exact path in
+future scans, `p` to protect it from future recommendations, or `t` to review moving it to the
+operating system Trash/Recycle Bin.
+
+SpaceMind asks for confirmation before saving an ignore or protection choice and before moving
+anything to Trash. Before a Trash action, it also checks that the path is still inside the scan
+root and still matches the saved type, size, modification time, and filesystem identity. If the
+item changed since the scan, the action stops and asks you to scan again. SpaceMind never
+permanently deletes an item and the local model cannot trigger actions.
+Once you ignore, protect, or move an item to Trash, it leaves the current review queue. Reopening
+the saved scan from history keeps those completed items out of the queue.
 
 You can also skip the selector and provide a folder directly:
 
@@ -55,7 +70,7 @@ spacemind scan ~ --ignore "**/.git/**" --ignore "node_modules"
 
 During the scan, SpaceMind reports progress for filesystem scanning, duplicate hashing,
 relationship detection, recommendation building, and optional local explanations. Press
-`Ctrl+C` to cancel safely. The analysis is read-only; no files are moved, deleted, or uploaded.
+`Ctrl+C` to cancel safely. Analysis itself is read-only and no file contents are uploaded.
 
 ## Local explanations with Ollama
 

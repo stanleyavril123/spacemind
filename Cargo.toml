@@ -5,8 +5,9 @@ members = [
     "crates/spacemind-core",
     "crates/spacemind-duplicates",
     "crates/spacemind-db",
-    "crates/spacemind-rules",
+    "crates/spacemind-platform",
     "crates/spacemind-relationships",
+    "crates/spacemind-rules",
     "crates/spacemind-scanner",
 ]
 resolver = "2"
@@ -26,6 +27,9 @@ serde = { version = "=1.0.197", features = ["derive"] }
 serde_json = "=1.0.115"
 rusqlite = { version = "=0.31.0", features = ["bundled"] }
 thiserror = "=1.0.58"
+trash = { version = "=4.1.1", default-features = false, features = [
+    "coinit_apartmentthreaded",
+] }
 unicode-width = "=0.2.0"
 ureq = { version = "=2.9.7", default-features = false }
 url = "=2.4.1"
@@ -35,6 +39,7 @@ spacemind-core = { path = "crates/spacemind-core" }
 spacemind-ai = { path = "crates/spacemind-ai" }
 spacemind-duplicates = { path = "crates/spacemind-duplicates" }
 spacemind-db = { path = "crates/spacemind-db" }
-spacemind-rules = { path = "crates/spacemind-rules" }
+spacemind-platform = { path = "crates/spacemind-platform" }
 spacemind-relationships = { path = "crates/spacemind-relationships" }
+spacemind-rules = { path = "crates/spacemind-rules" }
 spacemind-scanner = { path = "crates/spacemind-scanner" }

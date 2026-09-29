@@ -84,6 +84,7 @@ where
     let mut findings = Vec::new();
     let mut protected_items = 0_u64;
     let mut suppressed_findings = 0_u64;
+    let mut protected_ancestors = HashSet::new();
     let total_items = scan.items.len() as u64;
     let mut items_processed = 0_u64;
     report_rule_progress(&mut on_progress, items_processed, total_items, false);
@@ -99,24 +100,31 @@ where
         }
 
         let protected = protected_matcher.is_match(&item.path);
-        let findings_before_item = findings.len();
-        if item.size_bytes >= options.large_item_threshold_bytes {
-            findings.push(large_item_finding(item, options.large_item_threshold_bytes));
-        }
-
-        if let Some(finding) = classify_item(item, &context, options) {
-            findings.push(finding);
-        }
+        let finding = classify_item(item, &context, options).or_else(|| {
+            (item.size_bytes >= options.large_item_threshold_bytes)
+                .then(|| large_item_finding(item, options.large_item_threshold_bytes))
+        });
 
         if protected {
             protected_items = protected_items.saturating_add(1);
-            suppressed_findings = suppressed_findings
-                .saturating_add((findings.len() - findings_before_item) as u64);
-            findings.truncate(findings_before_item);
+            suppressed_findings = suppressed_findings.saturating_add(u64::from(finding.is_some()));
+            for ancestor in item.path.ancestors().skip(1) {
+                if !ancestor.starts_with(&scan.root) {
+                    break;
+                }
+                protected_ancestors.insert(ancestor.to_path_buf());
+            }
+        } else if let Some(finding) = finding {
+            findings.push(finding);
         }
         report_rule_progress(&mut on_progress, items_processed, total_items, false);
     }
 
+    let before_protected_ancestors = findings.len();
+    findings.retain(|finding| !protected_ancestors.contains(&finding.path));
+    suppressed_findings = suppressed_findings
+        .saturating_add((before_protected_ancestors - findings.len()) as u64);
+    collapse_nested_findings(&mut findings, scan);
     findings.sort_by(|left, right| {
         right
             .potential_recovery_bytes
@@ -133,6 +141,33 @@ where
         protected_items,
         suppressed_findings,
     })
+}
+
+fn collapse_nested_findings(findings: &mut Vec<Finding>, scan: &ScanResult) {
+    // A recognized directory already includes the bytes in its descendants. Keep
+    // those descendants in the scan and duplicate report, but show one cleanup
+    // recommendation for the directory rather than a long, overlapping list.
+    let directories: HashSet<_> = scan
+        .items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Directory)
+        .map(|item| item.path.as_path())
+        .collect();
+    let classified_directories: HashSet<_> = findings
+        .iter()
+        .filter(|finding| {
+            finding.category != FindingCategory::LargeItem
+                && directories.contains(finding.path.as_path())
+        })
+        .map(|finding| finding.path.clone())
+        .collect();
+    findings.retain(|finding| {
+        !finding
+            .path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| classified_directories.contains(ancestor))
+    });
 }
 
 fn report_rule_progress<F>(
@@ -236,7 +271,8 @@ fn classify_directory(item: &ScannedItem, context: &RuleContext) -> Option<Findi
             category: FindingCategory::AndroidEmulator,
             risk: RiskLevel::High,
             confidence: 0.98,
-            evidence: "Recognized as an Android Virtual Device; it may contain unique emulator state",
+            evidence: "Recognized as an Android Virtual Device; it may contain unique emulator \
+                state",
             suggested_action: SuggestedAction::ReviewForArchive,
         }
     } else if context.contains_virtual_machine(path) {
@@ -252,7 +288,8 @@ fn classify_directory(item: &ScannedItem, context: &RuleContext) -> Option<Findi
             category: FindingCategory::NodeModules,
             risk: RiskLevel::Medium,
             confidence: 0.99,
-            evidence: "Directory is a Node.js dependency installation that can usually be recreated",
+            evidence: "Directory is a Node.js dependency installation that can usually be \
+                recreated",
             suggested_action: SuggestedAction::ReviewForDeletion,
         }
     } else if lowercase_name(path) == "target"
@@ -324,7 +361,8 @@ fn classify_file(
             FindingCategory::VirtualMachine,
             RiskLevel::High,
             0.98,
-            "File extension is commonly used for a virtual-machine disk or package; it may contain unique guest data",
+            "File extension is commonly used for a virtual-machine disk or package; it may \
+             contain unique guest data",
             SuggestedAction::ReviewForArchive,
         ));
     }
@@ -698,6 +736,83 @@ mod tests {
     }
 
     #[test]
+    fn collapses_nested_recommendations_inside_a_recognized_directory() {
+        let outer = test_item("/test/project/node_modules", ItemKind::Directory, 1_000);
+        let nested = test_item(
+            "/test/project/node_modules/package/node_modules",
+            ItemKind::Directory,
+            400,
+        );
+        let generated = test_item(
+            "/test/project/node_modules/package/dist",
+            ItemKind::Directory,
+            200,
+        );
+        let unrelated = test_item("/test/other/build", ItemKind::Directory, 100);
+        let scan = scan_with_items("/test", vec![nested, unrelated, generated, outer]);
+
+        let findings = evaluate(
+            &scan,
+            &RuleOptions {
+                large_item_threshold_bytes: 500,
+                ..RuleOptions::default()
+            },
+        );
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].path, PathBuf::from("/test/project/node_modules"));
+        assert_eq!(findings[0].category, FindingCategory::NodeModules);
+        assert_eq!(findings[1].path, PathBuf::from("/test/other/build"));
+    }
+
+    #[test]
+    fn does_not_recommend_a_folder_containing_a_protected_item() {
+        let outer = test_item("/test/project/node_modules", ItemKind::Directory, 1_000);
+        let protected = test_item(
+            "/test/project/node_modules/private.txt",
+            ItemKind::File,
+            100,
+        );
+        let scan = scan_with_items("/test", vec![outer, protected]);
+        let evaluation = evaluate_with_policy_progress(
+            &scan,
+            &RuleOptions {
+                large_item_threshold_bytes: 500,
+                protected_rules: vec![PathRule::Exact(PathBuf::from(
+                    "/test/project/node_modules/private.txt",
+                ))],
+                ..RuleOptions::default()
+            },
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(evaluation.findings.is_empty());
+        assert_eq!(evaluation.protected_items, 1);
+        assert_eq!(evaluation.suppressed_findings, 1);
+    }
+
+    #[test]
+    fn a_specific_classification_replaces_a_generic_large_item_finding() {
+        let mut archive = test_item("/test/old.zip", ItemKind::File, 1_000);
+        archive.modified_at_epoch_seconds = Some(100 * DAY_SECONDS);
+
+        let findings = evaluate(
+            &scan_with(archive),
+            &RuleOptions {
+                large_item_threshold_bytes: 500,
+                old_item_threshold_days: 180,
+                now_epoch_seconds: 300 * DAY_SECONDS,
+                ..RuleOptions::default()
+            },
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, FindingCategory::OldArchive);
+    }
+
+    #[test]
     fn recognizes_rust_target_beside_a_cargo_manifest() {
         let manifest = test_item("/test/project/Cargo.toml", ItemKind::File, 50);
         let target = test_item("/test/project/target", ItemKind::Directory, 500);
@@ -948,7 +1063,7 @@ mod tests {
 
         assert!(evaluation.findings.is_empty());
         assert_eq!(evaluation.protected_items, 1);
-        assert_eq!(evaluation.suppressed_findings, 2);
+        assert_eq!(evaluation.suppressed_findings, 1);
     }
 
     #[test]
