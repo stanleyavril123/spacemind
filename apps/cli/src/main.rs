@@ -1,3 +1,5 @@
+mod review_actions;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -10,9 +12,8 @@ use spacemind_core::{
     Finding, FindingCategory, ItemKind, PathRule, ProgressEvent, RelationshipKind,
     RelationshipReport, RiskLevel, ScanResult, ScannedItem, SuggestedAction,
 };
-use spacemind_db::{
-    default_database_path, Analysis, Database, ScanHistoryEntry, StoredAnalysis,
-};
+use review_actions::{handle_review_action, prune_resolved_findings, ReviewAction, ReviewNotice};
+use spacemind_db::{default_database_path, Analysis, Database, ScanHistoryEntry, StoredAnalysis};
 use spacemind_duplicates::{detect_duplicates_with_progress, DuplicateOptions};
 use spacemind_relationships::{
     detect_relationships_with_progress, enrich_findings_with_relationships,
@@ -423,9 +424,9 @@ fn run_interactive(
                     theme,
                     false,
                 )? {
-                    let database = Database::open(&database_path)?;
-                    if let Some(analysis) = database.analysis(scan_id)? {
-                        review_analysis(&analysis, theme)?;
+                    let mut database = Database::open(&database_path)?;
+                    if let Some(mut analysis) = database.analysis(scan_id)? {
+                        review_analysis(&mut database, &mut analysis, theme)?;
                     }
                 }
             }
@@ -529,7 +530,7 @@ fn main_menu_lines(selected: usize, theme: Theme, layout: TerminalLayout) -> Vec
     let choices = [
         ("Scan storage", "analyze a folder"),
         ("Scan history", "review previous results"),
-        ("Quit", "leave without changing files"),
+        ("Quit", "close SpaceMind"),
     ];
     let label_width = layout.width.saturating_sub(18).clamp(8, 18);
     let description_width = layout.width.saturating_sub(12 + label_width);
@@ -581,19 +582,40 @@ fn run_scan(
         .transpose()?;
     let path = resolve_scan_path(args.path, args.format, theme)?;
     let mut ignored_rules = args.ignore;
+    if let Some(database) = &database {
+        extend_unique_path_rules(
+            &mut ignored_rules,
+            database
+                .ignored_item_paths()?
+                .into_iter()
+                .map(PathRule::Exact),
+        );
+    }
     let user_ignored_rule_count = ignored_rules.len();
     let mut automatic_ignore_rule_count = 0;
     if let Some(path) = &history_database_path {
         let database_rules = database_artifact_paths(path);
         automatic_ignore_rule_count = database_rules.len();
-        ignored_rules.extend(database_rules.into_iter().map(PathRule::Exact));
+        extend_unique_path_rules(
+            &mut ignored_rules,
+            database_rules.into_iter().map(PathRule::Exact),
+        );
     }
     let mut protected_rules = if args.no_default_protections {
         Vec::new()
     } else {
         default_protected_rules()
     };
-    protected_rules.extend(args.protect);
+    extend_unique_path_rules(&mut protected_rules, args.protect);
+    if let Some(database) = &database {
+        extend_unique_path_rules(
+            &mut protected_rules,
+            database
+                .protected_item_paths()?
+                .into_iter()
+                .map(PathRule::Exact),
+        );
+    }
 
     if args.format == OutputFormat::Human && io::stdout().is_terminal() {
         print_scan_start(&path, theme);
@@ -772,8 +794,8 @@ impl ReviewSection {
 }
 
 fn browse_history(database_path: &Path, theme: Theme) -> Result<(), Box<dyn Error>> {
-    let database = Database::open(database_path)?;
-    let history = database.scan_history(100)?;
+    let mut database = Database::open(database_path)?;
+    let mut history = database.scan_history(100)?;
     let mut selected = 0_usize;
 
     loop {
@@ -822,8 +844,10 @@ fn browse_history(database_path: &Path, theme: Theme) -> Result<(), Box<dyn Erro
         let Some(scan_id) = chosen else {
             return Ok(());
         };
-        if let Some(analysis) = database.analysis(scan_id)? {
-            review_analysis(&analysis, theme)?;
+        if let Some(mut analysis) = database.analysis(scan_id)? {
+            review_analysis(&mut database, &mut analysis, theme)?;
+            history = database.scan_history(100)?;
+            selected = selected.min(history.len().saturating_sub(1));
         }
     }
 }
@@ -918,10 +942,11 @@ fn history_browser_lines(
         let entry = &history[selected];
         lines.push(String::new());
         let summary = format!(
-            "{} recommendations • {} duplicate groups • {} relationships",
+            "{} recommendations • {} duplicate groups • {} relationships • {} in Trash",
             entry.recommendation_count,
             entry.duplicate_group_count,
-            entry.relationship_count
+            entry.relationship_count,
+            format_bytes(entry.recovered_space_bytes)
         );
         for (index, part) in wrap_text(&summary, layout.width.saturating_sub(14))
             .iter()
@@ -955,15 +980,28 @@ fn history_browser_lines(
     lines
 }
 
-fn review_analysis(analysis: &StoredAnalysis, theme: Theme) -> io::Result<()> {
+fn review_analysis(
+    database: &mut Database,
+    analysis: &mut StoredAnalysis,
+    theme: Theme,
+) -> Result<(), Box<dyn Error>> {
+    prune_resolved_findings(analysis);
     let stdout = io::stdout();
     let mut writer = stdout.lock();
     let mut section = ReviewSection::Recommendations;
     let mut selected = [0_usize; 5];
+    let mut notice: Option<ReviewNotice> = None;
     let _raw_mode = RawModeGuard::enter(&mut writer)?;
 
     loop {
-        render_review(&mut writer, analysis, section, selected[section_index(section)], theme)?;
+        render_review(
+            &mut writer,
+            analysis,
+            section,
+            selected[section_index(section)],
+            notice.as_ref(),
+            theme,
+        )?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -971,10 +1009,24 @@ fn review_analysis(analysis: &StoredAnalysis, theme: Theme) -> io::Result<()> {
             continue;
         }
         if is_control_c(key) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "application closed"));
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "application closed").into());
         }
         let section_position = section_index(section);
         let item_count = review_item_count(analysis, section);
+        if section == ReviewSection::Recommendations && item_count > 0 {
+            if let Some(action) = ReviewAction::from_key(&key.code) {
+                notice = handle_review_action(
+                    database,
+                    analysis,
+                    selected[section_position],
+                    action,
+                    |action, finding| confirm_review_action(&mut writer, action, finding, theme),
+                )?;
+                selected[section_position] = selected[section_position]
+                    .min(review_item_count(analysis, section).saturating_sub(1));
+                continue;
+            }
+        }
         match key.code {
             KeyCode::Left | KeyCode::Char('h') => {
                 section = ReviewSection::ALL
@@ -1019,10 +1071,11 @@ fn render_review<W: Write>(
     analysis: &StoredAnalysis,
     section: ReviewSection,
     selected: usize,
+    notice: Option<&ReviewNotice>,
     theme: Theme,
 ) -> io::Result<()> {
     let layout = terminal_layout(theme);
-    let lines = review_lines(analysis, section, selected, theme, layout);
+    let lines = review_lines(analysis, section, selected, notice, theme, layout);
     execute!(writer, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
     for (row, line) in lines.iter().take(layout.rows).enumerate() {
         execute!(
@@ -1038,6 +1091,7 @@ fn review_lines(
     analysis: &StoredAnalysis,
     section: ReviewSection,
     selected: usize,
+    notice: Option<&ReviewNotice>,
     theme: Theme,
     layout: TerminalLayout,
 ) -> Vec<String> {
@@ -1055,15 +1109,31 @@ fn review_lines(
         "  {}",
         theme.text(truncate_end(
             &format!(
-                "{} analyzed • {} recommendations • nothing changed",
+                "{} analyzed • {} left to review • {} in Trash",
                 format_bytes(summary.total_size_bytes),
-                summary.recommendation_count
+                analysis.findings.len(),
+                format_bytes(summary.recovered_space_bytes)
             ),
             layout.width.saturating_sub(2)
         ))
     ));
     lines.push(String::new());
     lines.push(review_tab_line(section, theme, layout.width));
+    if let Some(notice) = notice {
+        let marker = if notice.is_error {
+            theme.red("!")
+        } else {
+            theme.green("✓")
+        };
+        lines.push(format!(
+            "  {} {}",
+            marker,
+            theme.muted(truncate_end(
+                &notice.message,
+                layout.width.saturating_sub(6)
+            ))
+        ));
+    }
     lines.push(format!(
         "  {}",
         theme.border("─".repeat(layout.width.saturating_sub(4)))
@@ -1185,7 +1255,26 @@ fn push_review_overview(
     ));
     lines.push(review_metric(
         "local AI",
-        &format!("{} saved explanations", analysis.ai_explanations.len()),
+        &local_ai_summary(summary),
+        theme,
+        width,
+    ));
+    if summary.ai_status == "unavailable" {
+        if let Some(detail) = &summary.ai_status_detail {
+            let detail: String = detail
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect();
+            push_review_bullet(lines, &detail, theme, width);
+        }
+    }
+    lines.push(review_metric(
+        "your decisions",
+        &format!(
+            "{} saved • {} in Trash",
+            analysis.decisions.len(),
+            format_bytes(summary.recovered_space_bytes)
+        ),
         theme,
         width,
     ));
@@ -1194,7 +1283,7 @@ fn push_review_overview(
         "  {} {}",
         theme.green("✓"),
         theme.text(truncate_end(
-            "This scan only observed metadata. It did not change any files.",
+            "Scanning is read-only. Files change only after your explicit confirmation.",
             width.saturating_sub(4)
         ))
     ));
@@ -1212,7 +1301,7 @@ fn push_review_recommendations(
             "  {} {}",
             theme.green("✓"),
             theme.text(truncate_end(
-                "No cleanup candidates were found.",
+                "No recommendations left to review.",
                 layout.width.saturating_sub(6)
             ))
         ));
@@ -1222,6 +1311,13 @@ fn push_review_recommendations(
         "  {}",
         theme.text(truncate_end(
             "Safest and clearest candidates appear first — size is not the only factor",
+            layout.width.saturating_sub(2)
+        ))
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.muted(truncate_end(
+            "o open    i ignore    p protect    t move to Trash",
             layout.width.saturating_sub(2)
         ))
     ));
@@ -1586,6 +1682,21 @@ fn review_metric(label: &str, value: &str, theme: Theme, width: usize) -> String
     )
 }
 
+fn local_ai_summary(summary: &ScanHistoryEntry) -> String {
+    match summary.ai_status.as_str() {
+        "complete" | "partial" => format!(
+            "{} • {} explanations{}",
+            summary.ai_model.as_deref().unwrap_or("local model"),
+            summary.ai_explanation_count,
+            if summary.ai_status == "partial" { " (partial)" } else { "" }
+        ),
+        "disabled" => "disabled for this scan".to_owned(),
+        "no_candidates" => "no ambiguous items needed explanation".to_owned(),
+        "unavailable" => "unavailable for this scan".to_owned(),
+        other => other.replace('_', " "),
+    }
+}
+
 fn push_review_bullet(lines: &mut Vec<String>, value: &str, theme: Theme, width: usize) {
     let content_width = width.saturating_sub(8).max(1);
     for (index, part) in wrap_text(value, content_width).iter().enumerate() {
@@ -1627,6 +1738,89 @@ fn section_index(section: ReviewSection) -> usize {
         .expect("review section belongs to the static section list")
 }
 
+fn confirm_review_action<W: Write>(
+    writer: &mut W,
+    action: ReviewAction,
+    finding: &Finding,
+    theme: Theme,
+) -> io::Result<bool> {
+    let layout = terminal_layout(theme);
+    let mut lines = brand_header_lines_for_width(theme, "CONFIRM", layout.width).to_vec();
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.accent(action.confirmation_title())
+    ));
+    lines.push(format!(
+        "  {}",
+        theme.border("─".repeat(layout.width.saturating_sub(4)))
+    ));
+    lines.push(review_metric(
+        "item",
+        &finding.path.display().to_string(),
+        theme,
+        layout.width,
+    ));
+    lines.push(review_metric(
+        "potential space",
+        &format_bytes(finding.potential_recovery_bytes),
+        theme,
+        layout.width,
+    ));
+    lines.push(review_metric(
+        "risk",
+        risk_label(finding.risk),
+        theme,
+        layout.width,
+    ));
+    lines.push(String::new());
+    push_review_bullet(
+        &mut lines,
+        action.confirmation_explanation(),
+        theme,
+        layout.width,
+    );
+    if action == ReviewAction::MoveToTrash {
+        push_review_bullet(
+            &mut lines,
+            "SpaceMind will never permanently delete it or bypass the operating system Trash.",
+            theme,
+            layout.width,
+        );
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        theme.text("Continue?  y yes    n no")
+    ));
+
+    loop {
+        execute!(writer, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        for (row, line) in lines.iter().take(layout.rows).enumerate() {
+            execute!(
+                writer,
+                cursor::MoveTo(layout.margin as u16, row as u16),
+                crossterm::style::Print(line)
+            )?;
+        }
+        writer.flush()?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press) {
+            continue;
+        }
+        if is_control_c(key) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "application closed"));
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
 fn is_control_c(key: KeyEvent) -> bool {
     matches!(
         key,
@@ -1657,6 +1851,17 @@ fn database_artifact_paths(path: &Path) -> Vec<PathBuf> {
         paths.push(path.with_file_name(sidecar));
     }
     paths
+}
+
+fn extend_unique_path_rules(
+    rules: &mut Vec<PathRule>,
+    additional: impl IntoIterator<Item = PathRule>,
+) {
+    for rule in additional {
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
 }
 
 fn resolve_scan_path(
@@ -1732,7 +1937,9 @@ fn choose_directory<W: Write>(
                     if path.is_dir() {
                         break Ok(path);
                     }
-                    message = Some("That folder does not exist. Check the path and try again.".to_owned());
+                    message = Some(
+                        "That folder does not exist. Check the path and try again.".to_owned(),
+                    );
                 }
                 KeyCode::Esc => {
                     custom_input = None;
@@ -2067,7 +2274,7 @@ fn brand_header_lines_for_width(theme: Theme, active: &str, width: usize) -> [St
         + display_width(scan_label)
         + 3
         + display_width(report_label);
-    let right = "local / read only ";
+    let right = "local / user controlled ";
 
     let middle = if full_left_width + 1 + display_width(right) <= interior_width {
         let padding = interior_width - full_left_width - display_width(right);
@@ -2241,7 +2448,7 @@ fn progress_message(event: &ProgressEvent) -> String {
         AnalysisPhase::BuildingRecommendations => "Building advice",
         AnalysisPhase::DetectingRelationships => "Connecting context",
         AnalysisPhase::ExplainingCandidates => "Explaining context",
-        AnalysisPhase::Complete => unreachable!(),
+        AnalysisPhase::Complete => "Analysis complete",
     };
     let progress = match event.total_items {
         Some(total) if total > 0 => format!(
@@ -2991,20 +3198,24 @@ fn print_history(entries: &[ScanHistoryEntry], database_path: &Path, theme: Them
                 ),
                 RecordTone::Accent,
             );
-            let ai_history = match &entry.ai_model {
-                Some(model) => format!(
-                    "{} • {} explanations",
-                    model,
-                    format_count(entry.ai_explanation_count)
-                ),
-                None => entry.ai_status.replace('_', " "),
-            };
+            let ai_history = local_ai_summary(entry);
             print_record_field(theme, "local AI", &ai_history, RecordTone::Text);
+            if let Some(detail) = &entry.ai_status_detail {
+                print_record_field(theme, "AI detail", detail, RecordTone::Warning);
+            }
             if let Some(bytes) = entry.duplicate_recovery_bytes {
                 print_record_field(
                     theme,
                     "recoverable",
                     &format_bytes(bytes),
+                    RecordTone::Positive,
+                );
+            }
+            if entry.recovered_space_bytes > 0 {
+                print_record_field(
+                    theme,
+                    "in Trash",
+                    &format_bytes(entry.recovered_space_bytes),
                     RecordTone::Positive,
                 );
             }
@@ -3426,6 +3637,7 @@ fn parse_size(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spacemind_db::{DecisionKind, UserDecision};
 
     fn sample_stored_analysis() -> StoredAnalysis {
         let root = PathBuf::from("/home/example/Downloads");
@@ -3448,6 +3660,7 @@ mod tests {
                 recovered_space_bytes: 0,
                 ai_status: "complete".to_owned(),
                 ai_model: Some("qwen3:4b".to_owned()),
+                ai_status_detail: None,
                 ai_candidate_count: 1,
                 ai_explanation_count: 1,
             },
@@ -3471,6 +3684,7 @@ mod tests {
                 suggested_action: AiSuggestedAction::ReviewForDeletion,
             }],
             warnings: Vec::new(),
+            decisions: Vec::new(),
         }
     }
 
@@ -3499,7 +3713,10 @@ mod tests {
 
         assert_eq!(
             progress_message(&event),
-            "◐ Checking duplicates  [━━━━━━──────]  50%  2/4 • 1.0 KiB • folder/example.bin"
+            concat!(
+                "◐ Checking duplicates  [━━━━━━──────]  50%  2/4",
+                " • 1.0 KiB • folder/example.bin"
+            )
         );
     }
 
@@ -3594,6 +3811,7 @@ mod tests {
             &analysis,
             ReviewSection::Recommendations,
             0,
+            None,
             Theme::plain(),
             layout,
         );
@@ -3603,6 +3821,73 @@ mod tests {
         assert!(output.contains("potential space"));
         assert!(output.contains("LOCAL AI"));
         assert!(output.contains("never deletion permission"));
+        assert!(
+            lines
+                .iter()
+                .take(layout.rows)
+                .any(|line| line.contains("move to Trash")),
+            "review actions should be visible without scrolling"
+        );
+    }
+
+    #[test]
+    fn review_screen_advances_past_a_resolved_item() {
+        let mut analysis = sample_stored_analysis();
+        let path = analysis.findings[0].path.clone();
+        let mut next = analysis.findings[0].clone();
+        next.path = analysis.summary.root.join("next-archive.zip");
+        analysis.findings.push(next.clone());
+        analysis.decisions.push(UserDecision {
+            scan_id: Some(analysis.summary.id),
+            path,
+            decision: DecisionKind::Protected,
+            recovered_space_bytes: 0,
+            decided_at_epoch_seconds: 300,
+        });
+        prune_resolved_findings(&mut analysis);
+        let notice = ReviewNotice {
+            message: "Protected. Future scans will not recommend this path.".to_owned(),
+            is_error: false,
+        };
+        let layout = TerminalLayout::for_size(86, 30);
+
+        let output = review_lines(
+            &analysis,
+            ReviewSection::Recommendations,
+            0,
+            Some(&notice),
+            Theme::plain(),
+            layout,
+        )
+        .join("\n");
+
+        assert_eq!(analysis.findings.len(), 1);
+        assert_eq!(analysis.findings[0].path, next.path);
+        assert!(output.contains("next-archive.zip"));
+        assert!(!output.contains("large-archive.zip"));
+        assert!(output.contains("Future scans will not recommend"));
+    }
+
+    #[test]
+    fn review_overview_explains_an_unavailable_local_model() {
+        let mut analysis = sample_stored_analysis();
+        analysis.summary.ai_status = "unavailable".to_owned();
+        analysis.summary.ai_model = None;
+        analysis.summary.ai_status_detail = Some("Ollama is not running".to_owned());
+        analysis.ai_explanations.clear();
+
+        let output = review_lines(
+            &analysis,
+            ReviewSection::Overview,
+            0,
+            None,
+            Theme::plain(),
+            TerminalLayout::for_size(86, 30),
+        )
+        .join("\n");
+
+        assert!(output.contains("unavailable for this scan"));
+        assert!(output.contains("Ollama is not running"));
     }
 
     #[test]
@@ -3611,7 +3896,7 @@ mod tests {
         let layout = TerminalLayout::for_size(32, 24);
 
         for section in ReviewSection::ALL {
-            let lines = review_lines(&analysis, section, 0, Theme::plain(), layout);
+            let lines = review_lines(&analysis, section, 0, None, Theme::plain(), layout);
             assert!(
                 lines.iter().all(|line| display_width(line) <= layout.width),
                 "{section:?} contained an overflowing line: {lines:?}"

@@ -244,6 +244,7 @@ pub struct ScanHistoryEntry {
     pub recovered_space_bytes: u64,
     pub ai_status: String,
     pub ai_model: Option<String>,
+    pub ai_status_detail: Option<String>,
     pub ai_candidate_count: u64,
     pub ai_explanation_count: u64,
 }
@@ -256,6 +257,7 @@ pub struct StoredAnalysis {
     pub relationships: Vec<Relationship>,
     pub ai_explanations: Vec<AiExplanation>,
     pub warnings: Vec<StoredWarning>,
+    pub decisions: Vec<UserDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +266,24 @@ pub struct StoredWarning {
     pub path: Option<PathBuf>,
     pub kind: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    Ignored,
+    Protected,
+    Trashed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserDecision {
+    pub scan_id: Option<i64>,
+    #[serde(serialize_with = "serialize_path", deserialize_with = "deserialize_path")]
+    pub path: PathBuf,
+    pub decision: DecisionKind,
+    pub recovered_space_bytes: u64,
+    pub decided_at_epoch_seconds: u64,
 }
 
 impl Database {
@@ -362,7 +382,8 @@ impl Database {
                     total_allocated_size_bytes, file_count, directory_count, \
                     recommendation_count, duplicate_group_count, relationship_count, \
                     scan_warning_count + duplicate_warning_count, duplicate_recovery_bytes, \
-                    recovered_space_bytes, ai_status, ai_model, ai_candidate_count, \
+                    recovered_space_bytes, ai_status, ai_model, ai_status_detail, \
+                    ai_candidate_count, \
                     (SELECT COUNT(*) FROM ai_explanations WHERE scan_id = scans.id) \
              FROM scans ORDER BY completed_at DESC, id DESC LIMIT ?1",
         )?;
@@ -378,7 +399,8 @@ impl Database {
                         total_allocated_size_bytes, file_count, directory_count, \
                         recommendation_count, duplicate_group_count, relationship_count, \
                         scan_warning_count + duplicate_warning_count, duplicate_recovery_bytes, \
-                        recovered_space_bytes, ai_status, ai_model, ai_candidate_count, \
+                        recovered_space_bytes, ai_status, ai_model, ai_status_detail, \
+                        ai_candidate_count, \
                         (SELECT COUNT(*) FROM ai_explanations WHERE scan_id = scans.id) \
                  FROM scans WHERE id = ?1",
                 [scan_id],
@@ -399,7 +421,111 @@ impl Database {
             relationships: self.relationships(scan_id)?,
             ai_explanations: self.ai_explanations(scan_id)?,
             warnings: self.warnings(scan_id)?,
+            decisions: self.user_decisions(scan_id)?,
         }))
+    }
+
+    pub fn scanned_item(&self, scan_id: i64, path: &Path) -> Result<Option<ScannedItem>> {
+        self.connection
+            .query_row(
+                "SELECT path, kind, size_bytes, allocated_size_bytes, volume_id, file_id, \
+                        hard_link_count, created_at, modified_at, modified_at_nanoseconds, \
+                        accessed_at, extension FROM scan_items WHERE scan_id = ?1 AND path = ?2",
+                params![scan_id, path_bytes(path)],
+                read_scanned_item,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn ignored_item_paths(&self) -> Result<Vec<PathBuf>> {
+        self.policy_paths(
+            "SELECT value FROM ignored_items WHERE rule_kind = 'exact' ORDER BY id",
+        )
+    }
+
+    pub fn protected_item_paths(&self) -> Result<Vec<PathBuf>> {
+        self.policy_paths(
+            "SELECT value FROM protected_paths WHERE rule_kind = 'exact' ORDER BY id",
+        )
+    }
+
+    pub fn ignore_item(&mut self, scan_id: i64, path: &Path) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO ignored_items (rule_kind, value) VALUES ('exact', ?1)",
+            [path_bytes(path)],
+        )?;
+        insert_user_decision(&transaction, scan_id, path, DecisionKind::Ignored, 0)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn protect_item(&mut self, scan_id: i64, path: &Path) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO protected_paths (rule_kind, value) VALUES ('exact', ?1)",
+            [path_bytes(path)],
+        )?;
+        insert_user_decision(&transaction, scan_id, path, DecisionKind::Protected, 0)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_trashed_item(
+        &mut self,
+        scan_id: i64,
+        path: &Path,
+        recovered_space_bytes: u64,
+    ) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        let inserted = insert_user_decision(
+            &transaction,
+            scan_id,
+            path,
+            DecisionKind::Trashed,
+            recovered_space_bytes,
+        )?;
+        if inserted {
+            transaction.execute(
+                "UPDATE scans SET recovered_space_bytes = recovered_space_bytes + ?1 WHERE id = ?2",
+                params![
+                    integer(recovered_space_bytes, "decision.recovered_space_bytes")?,
+                    scan_id
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn policy_paths(&self, sql: &str) -> Result<Vec<PathBuf>> {
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map([], |row| stored_path(row.get(0)?))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn user_decisions(&self, scan_id: i64) -> Result<Vec<UserDecision>> {
+        let mut statement = self.connection.prepare(
+            "SELECT scan_id, path, decision, recovered_space_bytes, decided_at \
+             FROM user_decisions WHERE scan_id = ?1 ORDER BY decided_at, id",
+        )?;
+        let mut rows = statement.query([scan_id])?;
+        let mut decisions = Vec::new();
+        while let Some(row) = rows.next()? {
+            decisions.push(UserDecision {
+                scan_id: row.get(0)?,
+                path: stored_path(row.get(1)?)?,
+                decision: deserialized_name(&row.get::<_, String>(2)?)?,
+                recovered_space_bytes: stored_integer(
+                    row.get(3)?,
+                    "decision.recovered_space_bytes",
+                )?,
+                decided_at_epoch_seconds: stored_integer(row.get(4)?, "decision.decided_at")?,
+            });
+        }
+        Ok(decisions)
     }
 
     fn findings(&self, scan_id: i64) -> Result<Vec<Finding>> {
@@ -812,6 +938,31 @@ fn insert_ignored_paths(
     Ok(())
 }
 
+fn insert_user_decision(
+    transaction: &Transaction<'_>,
+    scan_id: i64,
+    path: &Path,
+    decision: DecisionKind,
+    recovered_space_bytes: u64,
+) -> Result<bool> {
+    let decision = serialized_name(&decision)?;
+    let path = path_bytes(path);
+    let inserted = transaction.execute(
+        "INSERT INTO user_decisions (scan_id, path, decision, recovered_space_bytes) \
+         SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (\
+             SELECT 1 FROM user_decisions \
+             WHERE scan_id = ?1 AND path = ?2 AND decision = ?3\
+         )",
+        params![
+            scan_id,
+            path,
+            decision,
+            integer(recovered_space_bytes, "decision.recovered_space_bytes")?
+        ],
+    )?;
+    Ok(inserted == 1)
+}
+
 fn insert_ai_explanations(
     transaction: &Transaction<'_>,
     scan_id: i64,
@@ -948,8 +1099,33 @@ fn read_history_row(row: &Row<'_>) -> rusqlite::Result<ScanHistoryEntry> {
         recovered_space_bytes: stored_integer(row.get(13)?, "recovered_space_bytes")?,
         ai_status: row.get(14)?,
         ai_model: row.get(15)?,
-        ai_candidate_count: stored_integer(row.get(16)?, "ai_candidate_count")?,
-        ai_explanation_count: stored_integer(row.get(17)?, "ai_explanation_count")?,
+        ai_status_detail: row.get(16)?,
+        ai_candidate_count: stored_integer(row.get(17)?, "ai_candidate_count")?,
+        ai_explanation_count: stored_integer(row.get(18)?, "ai_explanation_count")?,
+    })
+}
+
+fn read_scanned_item(row: &Row<'_>) -> rusqlite::Result<ScannedItem> {
+    let volume_id = stored_optional_integer(row.get(4)?, "item.volume_id")?;
+    let file_id = stored_optional_integer(row.get(5)?, "item.file_id")?;
+    Ok(ScannedItem {
+        path: stored_path(row.get(0)?)?,
+        kind: stored_name(row.get(1)?)?,
+        size_bytes: stored_integer(row.get(2)?, "item.size_bytes")?,
+        allocated_size_bytes: stored_optional_integer(row.get(3)?, "item.allocated_size_bytes")?,
+        file_identity: match (volume_id, file_id) {
+            (Some(volume_id), Some(file_id)) => Some(FileIdentity { volume_id, file_id }),
+            _ => None,
+        },
+        hard_link_count: stored_optional_integer(row.get(6)?, "item.hard_link_count")?,
+        created_at_epoch_seconds: stored_optional_integer(row.get(7)?, "item.created_at")?,
+        modified_at_epoch_seconds: stored_optional_integer(row.get(8)?, "item.modified_at")?,
+        modified_at_epoch_nanoseconds: stored_optional_integer(
+            row.get(9)?,
+            "item.modified_at_nanoseconds",
+        )?,
+        accessed_at_epoch_seconds: stored_optional_integer(row.get(10)?, "item.accessed_at")?,
+        extension: row.get(11)?,
     })
 }
 
@@ -962,6 +1138,16 @@ fn serialized_name<T: Serialize>(value: &T) -> Result<String> {
 
 fn deserialized_name<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(Into::into)
+}
+
+fn stored_name<T: for<'de> Deserialize<'de>>(value: String) -> rusqlite::Result<T> {
+    serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 fn stored_action_rank(action: spacemind_core::SuggestedAction) -> u8 {
@@ -1264,6 +1450,80 @@ mod tests {
     }
 
     #[test]
+    fn persists_review_actions_and_recovered_space_without_double_counting() {
+        let mut database = Database::open_in_memory().unwrap();
+        let scan = sample_scan();
+        let finding = sample_finding();
+        let duplicates = sample_duplicates();
+        let relationships = sample_relationships();
+        let ai = sample_ai();
+        let id = database
+            .save_analysis(Analysis {
+                scan: &scan,
+                findings: &[finding.clone()],
+                duplicates: &duplicates,
+                relationships: &relationships,
+                ai: &ai,
+            })
+            .unwrap();
+
+        assert_eq!(
+            database.scanned_item(id, &finding.path).unwrap(),
+            Some(scan.items[0].clone())
+        );
+        database.ignore_item(id, &finding.path).unwrap();
+        database.protect_item(id, &finding.path).unwrap();
+        database
+            .record_trashed_item(id, &finding.path, finding.potential_recovery_bytes)
+            .unwrap();
+        database
+            .record_trashed_item(id, &finding.path, finding.potential_recovery_bytes)
+            .unwrap();
+
+        assert_eq!(database.ignored_item_paths().unwrap(), vec![finding.path.clone()]);
+        assert_eq!(
+            database.protected_item_paths().unwrap(),
+            vec![finding.path.clone()]
+        );
+        let stored = database.analysis(id).unwrap().unwrap();
+        assert_eq!(stored.decisions.len(), 3);
+        assert_eq!(
+            stored.summary.recovered_space_bytes,
+            finding.potential_recovery_bytes
+        );
+        assert_eq!(database.row_count("user_decisions"), 3);
+    }
+
+    #[test]
+    fn saved_review_explains_why_local_ai_was_unavailable() {
+        let mut database = Database::open_in_memory().unwrap();
+        let scan = sample_scan();
+        let duplicates = sample_duplicates();
+        let relationships = sample_relationships();
+        let ai = AiReport {
+            status: AiStatus::Unavailable {
+                reason: "Ollama is not running".to_owned(),
+            },
+            candidates_considered: 1,
+            explanations: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let id = database
+            .save_analysis(Analysis {
+                scan: &scan,
+                findings: &[],
+                duplicates: &duplicates,
+                relationships: &relationships,
+                ai: &ai,
+            })
+            .unwrap();
+
+        let summary = database.analysis(id).unwrap().unwrap().summary;
+        assert_eq!(summary.ai_status, "unavailable");
+        assert_eq!(summary.ai_status_detail.as_deref(), Some("Ollama is not running"));
+    }
+
+    #[test]
     fn rejects_values_that_sqlite_cannot_represent_before_writing() {
         let mut database = Database::open_in_memory().unwrap();
         let mut scan = sample_scan();
@@ -1379,7 +1639,7 @@ mod tests {
         let relationships = sample_relationships();
         let ai = sample_ai();
 
-        database
+        let id = database
             .save_analysis(Analysis {
                 scan: &scan,
                 findings: &[],
@@ -1388,10 +1648,19 @@ mod tests {
                 ai: &ai,
             })
             .unwrap();
+        database.ignore_item(id, &scan.items[0].path).unwrap();
 
         assert_eq!(database.row_count("scan_items"), 2);
         let history = database.scan_history(1).unwrap();
         assert_eq!(history[0].root, scan.root);
+        assert_eq!(
+            database.ignored_item_paths().unwrap(),
+            vec![scan.items[0].path.clone()]
+        );
+        assert_eq!(
+            database.analysis(id).unwrap().unwrap().decisions[0].path,
+            scan.items[0].path
+        );
         assert!(serde_json::to_string(&history).is_ok());
     }
 }

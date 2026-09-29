@@ -1,4 +1,5 @@
 use serde_json::Value;
+use spacemind_db::Database;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -101,7 +102,12 @@ fn applies_ignore_and_protect_rules_end_to_end() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|finding| !finding["path"].as_str().unwrap().starts_with(protected.to_str().unwrap())));
+        .all(|finding| {
+            !finding["path"]
+                .as_str()
+                .unwrap()
+                .starts_with(protected.to_str().unwrap())
+        }));
     let group = &json["duplicates"]["groups"][0];
     assert_eq!(group["protected_file_count"], 1);
     assert_eq!(
@@ -113,6 +119,76 @@ fn applies_ignore_and_protect_rules_end_to_end() {
             .count(),
         1
     );
+}
+
+#[test]
+fn saved_review_choices_apply_to_the_next_scan() {
+    let directory = TestDirectory::new();
+    let state = TestDirectory::new();
+    let database_path = state.0.join("history.db");
+    let ignored = directory.0.join("ignored-node_modules");
+    let protected = directory.0.join("protected-node_modules");
+    fs::create_dir(&ignored).unwrap();
+    fs::create_dir(&protected).unwrap();
+    fs::write(ignored.join("package.js"), [1_u8; 16]).unwrap();
+    fs::write(protected.join("package.js"), [2_u8; 16]).unwrap();
+
+    let first_scan = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .arg("--database")
+        .arg(&database_path)
+        .args([
+            "scan",
+            directory.0.to_str().unwrap(),
+            "--format",
+            "json",
+            "--large-threshold",
+            "1B",
+            "--no-ai",
+        ])
+        .output()
+        .unwrap();
+    assert!(first_scan.status.success());
+
+    let mut database = Database::open(&database_path).unwrap();
+    database.ignore_item(1, &ignored).unwrap();
+    database.protect_item(1, &protected).unwrap();
+    drop(database);
+
+    let second_scan = Command::new(env!("CARGO_BIN_EXE_spacemind"))
+        .arg("--database")
+        .arg(&database_path)
+        .args([
+            "scan",
+            directory.0.to_str().unwrap(),
+            "--format",
+            "json",
+            "--large-threshold",
+            "1B",
+            "--no-ai",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        second_scan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_scan.stderr)
+    );
+    let json: Value = serde_json::from_slice(&second_scan.stdout).unwrap();
+
+    assert!(json["scan"]["ignored_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path.as_str() == ignored.to_str()));
+    assert!(json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|finding| finding["path"].as_str() != protected.to_str()));
+    assert!(json["policy"]["suppressed_recommendations"]
+        .as_u64()
+        .unwrap()
+        > 0);
 }
 
 #[test]
